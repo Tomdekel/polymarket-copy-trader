@@ -1,0 +1,41 @@
+# Polymarket Copy Trader Configuration
+
+# Target wallet to copy
+target_wallet: "anoin123"
+
+# Starting budget in USD
+starting_budget: 10000
+
+# Position Sizing Strategy
+position_sizing:
+  strategy: "proportional"  # Options: proportional, fixed, risk_parity
+  max_position_pct: 0.15    # Max 15% of portfolio in single position
+  min_position_pct: 0.01    # Min 1% of portfolio
+  leverage_cap: 1.0         # No leverage (conservative)
+
+# Risk Management
+risk_management:
+  max_daily_loss_pct: 0.10  # Stop if down 10% in a day
+  max_total_loss_pct: 0.25  # Stop if down 25% total
+  cooldown_after_loss: 300  # Wait 5 min after big loss (seconds)
+  skip_high_risk_markets: true
+
+# Market Filters
+filters:
+  min_liquidity: 1000       # Min $1000 liquidity
+  max_slippage: 0.05        # Max 5% slippage
+  excluded_markets: []      # Market IDs to avoid
+  max_time_to_resolution: 2592000  # Max 30 days out
+
+# Execution
+execution:
+  check_interval: 30        # Check for new trades every 30 seconds
+  dry_run: true            # Start in simulation mode
+  auto_execute: false      # Require manual approval for trades
+
+# Reporting
+reporting:
+  console_output: true
+  log_level: "INFO"
+  save_charts: true
+  webhook_url: ""          # Discord webhook for alerts (optional)
