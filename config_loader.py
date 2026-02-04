@@ -176,6 +176,13 @@ def get_db_path(config: Dict[str, Any]) -> str:
 
 
 def get_webhook_url(config: Dict[str, Any]) -> Optional[str]:
-    """Get webhook URL from config, returns None if empty."""
+    """Get webhook URL from config, returns None if empty or placeholder.
+
+    Note: Treats 'placeholder', 'disabled', and 'none' as disabled for
+    compatibility with Secret Manager which doesn't allow empty values.
+    """
     url = config.get("reporting", {}).get("webhook_url", "")
-    return url if url else None
+    # Treat certain placeholder values as disabled
+    if not url or url.lower() in ("placeholder", "disabled", "none", "null"):
+        return None
+    return url

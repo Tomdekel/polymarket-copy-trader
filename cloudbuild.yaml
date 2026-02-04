@@ -38,7 +38,7 @@ steps:
       - '--platform'
       - 'managed'
       # Always-on for continuous operation
-      - '--cpu-always-allocated'
+      - '--no-cpu-throttling'
       - '--min-instances=1'
       - '--max-instances=1'
       # Resource allocation
