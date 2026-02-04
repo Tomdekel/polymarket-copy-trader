@@ -205,13 +205,25 @@ def copy(ctx, wallet: str, budget: float, dry_run: bool, health_port: int):
                     if current_price is None:
                         logger.warning(f"No price data for {pos.market}, using fallback 0.5")
                         current_price = 0.5
-                    db.add_trade(
-                        market=pos.market,
-                        side=pos.action,
-                        size=pos.our_size,
-                        price=current_price,
-                        target_wallet=wallet
-                    )
+
+                    if pos.action == "BUY":
+                        # Record new buy position
+                        db.add_trade(
+                            market=pos.market,
+                            side=pos.action,
+                            size=pos.our_size,
+                            price=current_price,
+                            target_wallet=wallet
+                        )
+                    elif pos.action == "SELL":
+                        # Close existing position and realize PnL
+                        existing_position = db.get_position_by_market(pos.market)
+                        if existing_position:
+                            pnl = db.close_trade(existing_position['id'], current_price)
+                            logger.info(f"Closed position {pos.market[:16]}... PnL: {pnl:+.2f}")
+                        else:
+                            logger.warning(f"No open position found for {pos.market}, skipping SELL")
+
                     trades_count += 1
 
                     # Send trade notification

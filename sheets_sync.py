@@ -287,33 +287,47 @@ class GoogleSheetsSync:
         worksheet = sheet.worksheet(TAB_OUR_TRADES)
 
         # Header row
-        headers = ["Timestamp", "Market", "Side", "Size", "Price", "P&L", "Status"]
+        headers = ["Opened", "Market", "Size", "Buy Price", "Sell Price", "P&L", "Closed", "Status"]
         data = [headers]
 
         # Add trade rows
         for trade in trades:
-            timestamp = trade.get("timestamp", "")
-            # Format timestamp if it's an ISO string
-            if isinstance(timestamp, str) and "T" in timestamp:
+            # Format open timestamp
+            open_timestamp = trade.get("timestamp", "")
+            if isinstance(open_timestamp, str) and "T" in open_timestamp:
                 try:
-                    dt = datetime.fromisoformat(timestamp)
-                    timestamp = dt.strftime("%Y-%m-%d %H:%M")
+                    dt = datetime.fromisoformat(open_timestamp)
+                    open_timestamp = dt.strftime("%Y-%m-%d %H:%M")
                 except ValueError:
                     pass
+
+            # Format close timestamp
+            close_timestamp = trade.get("closed_at", "")
+            if isinstance(close_timestamp, str) and "T" in close_timestamp:
+                try:
+                    dt = datetime.fromisoformat(close_timestamp)
+                    close_timestamp = dt.strftime("%Y-%m-%d %H:%M")
+                except ValueError:
+                    pass
+            if not close_timestamp:
+                close_timestamp = "-"
 
             pnl = trade.get("pnl")
             pnl_str = self._format_pnl(pnl) if pnl is not None else "-"
 
             size = trade.get("size") or 0
-            price = trade.get("price") or 0
+            buy_price = trade.get("price") or 0
+            sell_price = trade.get("sell_price")
+            sell_price_str = f"{sell_price:.4f}" if sell_price is not None else "-"
 
             row = [
-                timestamp,
+                open_timestamp,
                 trade.get("market") or "Unknown",
-                trade.get("side") or "",
                 self._format_currency(size),
-                f"{price:.4f}",
+                f"{buy_price:.4f}",
+                sell_price_str,
                 pnl_str,
+                close_timestamp,
                 trade.get("status") or "open",
             ]
             data.append(row)

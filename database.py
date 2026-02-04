@@ -89,6 +89,18 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # Add sell_price column if it doesn't exist (for tracking exit price)
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN sell_price REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Add closed_at column if it doesn't exist (for tracking when trade was closed)
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN closed_at TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # Create indexes for frequently queried columns
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
@@ -251,10 +263,10 @@ class Database:
             pnl = (entry_price - exit_price) * size
             proceeds = size * exit_price
 
-        # Update trade status and PnL
+        # Update trade status, PnL, sell price, and closed timestamp
         conn.execute(
-            "UPDATE trades SET status = 'closed', pnl = ? WHERE id = ?",
-            (pnl, trade_id)
+            "UPDATE trades SET status = 'closed', pnl = ?, sell_price = ?, closed_at = ? WHERE id = ?",
+            (pnl, exit_price, datetime.now().isoformat(), trade_id)
         )
 
         # Add proceeds back to cash and update total PnL
