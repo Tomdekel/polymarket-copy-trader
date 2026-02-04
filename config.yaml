@@ -1,7 +1,7 @@
 # Polymarket Copy Trader Configuration
 
-# Target wallet to copy
-target_wallet: "anoin123"
+# Target wallet to copy (set via CLI --wallet flag or COPY_TRADER_TARGET_WALLET env var)
+# target_wallet: "0x..."  # Must be a valid Ethereum address
 
 # Starting budget in USD
 starting_budget: 10000
@@ -29,9 +29,16 @@ filters:
 
 # Execution
 execution:
-  check_interval: 30        # Check for new trades every 30 seconds
+  check_interval: 180       # Check for new trades every 3 minutes
   dry_run: true            # Start in simulation mode
   auto_execute: false      # Require manual approval for trades
+
+# API Settings
+api:
+  max_retries: 3            # Max retry attempts for API calls
+  min_wait: 1               # Minimum wait between retries (seconds)
+  max_wait: 30              # Maximum wait between retries (seconds)
+  timeout: 30               # Request timeout (seconds)
 
 # Reporting
 reporting:

@@ -1,0 +1,67 @@
+# Cloud Build configuration for Polymarket Copy Trader
+# Deploy with: gcloud builds submit --config cloudbuild.yaml
+
+substitutions:
+  _SERVICE_NAME: polymarket-copy-trader
+  _REGION: us-central1
+  _IMAGE_TAG: latest
+
+steps:
+  # Build the container image
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:${_IMAGE_TAG}'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$SHORT_SHA'
+      - '.'
+
+  # Push the container image to Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '--all-tags'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}'
+
+  # Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - '${_SERVICE_NAME}'
+      - '--image'
+      - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:${_IMAGE_TAG}'
+      - '--region'
+      - '${_REGION}'
+      - '--platform'
+      - 'managed'
+      # Always-on for continuous operation
+      - '--cpu-always-allocated'
+      - '--min-instances=1'
+      - '--max-instances=1'
+      # Resource allocation
+      - '--memory=512Mi'
+      - '--cpu=1'
+      - '--timeout=3600'
+      # Port configuration
+      - '--port=8080'
+      # Environment variables (non-secrets)
+      - '--set-env-vars'
+      - 'COPY_TRADER_DRY_RUN=true,COPY_TRADER_LOG_LEVEL=INFO,COPY_TRADER_DB_PATH=/app/data/trades.db'
+      # Secrets from Secret Manager
+      - '--set-secrets'
+      - 'COPY_TRADER_TARGET_WALLET=polymarket-target-wallet:latest,COPY_TRADER_WEBHOOK_URL=polymarket-webhook-url:latest'
+      # No public access (trigger manually or via scheduler)
+      - '--no-allow-unauthenticated'
+
+# Use Cloud Storage for persistent database (optional)
+# Note: For production, consider using Cloud SQL or Firestore instead of SQLite
+
+images:
+  - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:${_IMAGE_TAG}'
+  - 'gcr.io/$PROJECT_ID/${_SERVICE_NAME}:$SHORT_SHA'
+
+options:
+  logging: CLOUD_LOGGING_ONLY

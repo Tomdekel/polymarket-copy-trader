@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  copy-trader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-copy-trader
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - COPY_TRADER_DB_PATH=/app/data/trades.db
+      - COPY_TRADER_DRY_RUN=${COPY_TRADER_DRY_RUN:-true}
+      - COPY_TRADER_TARGET_WALLET=${COPY_TRADER_TARGET_WALLET:-}
+      - COPY_TRADER_BUDGET=${COPY_TRADER_BUDGET:-10000}
+      - COPY_TRADER_WEBHOOK_URL=${COPY_TRADER_WEBHOOK_URL:-}
+      - COPY_TRADER_LOG_LEVEL=${COPY_TRADER_LOG_LEVEL:-INFO}
+    ports:
+      - "8080:8080"
+    command: ["copy", "--wallet", "${COPY_TRADER_TARGET_WALLET}", "--budget", "${COPY_TRADER_BUDGET:-10000}"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Development mode with interactive shell
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: polymarket-copy-trader-dev
+    volumes:
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+      - .:/app/src:ro
+    environment:
+      - COPY_TRADER_DB_PATH=/app/data/trades.db
+      - COPY_TRADER_DRY_RUN=true
+      - COPY_TRADER_LOG_LEVEL=DEBUG
+    ports:
+      - "8080:8080"
+    command: ["--help"]
+    profiles:
+      - dev
+
+volumes:
+  data:
