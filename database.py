@@ -101,10 +101,41 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # Add current_price column if it doesn't exist (for real-time P&L tracking)
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN current_price REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Add market_slug column if it doesn't exist (for readable market names)
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN market_slug TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Add outcome column if it doesn't exist (YES/NO for position side)
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN outcome TEXT")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Create pnl_history table for time-series comparison
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pnl_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                our_pnl_pct REAL,
+                whale_pnl_pct REAL,
+                our_total_invested REAL,
+                whale_total_invested REAL
+            )
+        """)
+
         # Create indexes for frequently queried columns
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_status ON trades(market, status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pnl_history_timestamp ON pnl_history(timestamp)")
         conn.commit()
 
     def close(self) -> None:
@@ -161,7 +192,8 @@ class Database:
         return {"total_value": 0, "cash": 0, "initial_budget": 0, "pnl_24h": 0, "pnl_total": 0}
 
     def add_trade(self, market: str, side: str, size: float,
-                  price: float, target_wallet: str) -> int:
+                  price: float, target_wallet: str, market_slug: str = "",
+                  outcome: str = "") -> int:
         """Add a trade and update cash balance accordingly.
 
         Args:
@@ -170,6 +202,8 @@ class Database:
             size: Trade size
             price: Trade price
             target_wallet: Target wallet address being copied
+            market_slug: Human-readable market name/slug (optional)
+            outcome: Position outcome (YES or NO, from target position)
 
         Returns:
             Trade ID
@@ -183,32 +217,45 @@ class Database:
 
         if size <= 0:
             raise ValueError("Trade size must be positive")
-        if price < 0:
-            raise ValueError("Trade price cannot be negative")
+        if price <= 0:
+            raise ValueError("Trade price must be positive")
         if len(target_wallet) > MAX_WALLET_ADDRESS_LENGTH:
             raise ValueError("Invalid target wallet address")
 
         with self._lock:
             conn = self._get_conn()
             cursor = conn.execute(
-                """INSERT INTO trades (timestamp, market, side, size, price, target_wallet)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (datetime.now().isoformat(), market, side, size, price, target_wallet)
+                """INSERT INTO trades (timestamp, market, side, size, price, target_wallet, market_slug, outcome)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (datetime.now().isoformat(), market, side, size, price, target_wallet, market_slug, outcome)
             )
             trade_id = cursor.lastrowid
 
             # Update cash: subtract for BUY, add for SELL
-            cost = size * price if price > 0 else size
+            # Note: 'size' is USD invested, not number of shares
             if side == "BUY":
-                conn.execute("UPDATE portfolio SET cash = cash - ? WHERE id = 1", (cost,))
+                conn.execute("UPDATE portfolio SET cash = cash - ? WHERE id = 1", (size,))
             elif side == "SELL":
-                conn.execute("UPDATE portfolio SET cash = cash + ? WHERE id = 1", (cost,))
+                # For SELL, we'd be receiving USD back (but this path is rarely used
+                # since we usually close positions via close_trade())
+                conn.execute("UPDATE portfolio SET cash = cash + ? WHERE id = 1", (size,))
 
             conn.commit()
             return trade_id
 
     def update_trade_pnl(self, trade_id: int, current_price: float) -> float:
-        """Update PnL for a specific trade based on current price."""
+        """Update PnL and current price for a specific trade.
+
+        Note: 'size' in the database is USD invested, not number of shares.
+        We must convert to shares first: shares = size / entry_price
+
+        Args:
+            trade_id: The trade ID to update
+            current_price: Current market price
+
+        Returns:
+            Calculated P&L value
+        """
         conn = self._get_conn()
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
@@ -221,24 +268,36 @@ class Database:
             return 0.0
 
         entry_price = row["price"]
-        size = row["size"]
+        size = row["size"]  # USD invested, not shares
         side = row["side"]
 
-        if entry_price == 0:
+        if entry_price <= 0:
             return 0.0
 
-        # Calculate PnL: for BUY, profit if price goes up; for SELL (short), profit if price goes down
-        if side.upper() == "BUY":
-            pnl = (current_price - entry_price) * size
-        else:
-            pnl = (entry_price - current_price) * size
+        # Convert USD invested to number of shares
+        shares = size / entry_price
 
-        conn.execute("UPDATE trades SET pnl = ? WHERE id = ?", (pnl, trade_id))
+        # Calculate P&L based on shares
+        # For BUY, profit if price goes up; for SELL (short), profit if price goes down
+        if side.upper() == "BUY":
+            pnl = (current_price - entry_price) * shares
+        else:
+            pnl = (entry_price - current_price) * shares
+
+        # Store both P&L and current price for display
+        conn.execute(
+            "UPDATE trades SET pnl = ?, current_price = ? WHERE id = ?",
+            (pnl, current_price, trade_id)
+        )
         conn.commit()
         return pnl
 
     def close_trade(self, trade_id: int, exit_price: float) -> float:
-        """Close a trade and realize PnL."""
+        """Close a trade and realize PnL.
+
+        Note: 'size' in the database is USD invested, not number of shares.
+        We must convert to shares first: shares = size / entry_price
+        """
         conn = self._get_conn()
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
@@ -251,17 +310,23 @@ class Database:
             return 0.0
 
         entry_price = row["price"]
-        size = row["size"]
+        size = row["size"]  # USD invested, not shares
         side = row["side"]
 
-        # Calculate final PnL
+        if entry_price <= 0:
+            return 0.0
+
+        # Convert USD invested to number of shares
+        shares = size / entry_price
+
+        # Calculate final PnL based on shares
         if side.upper() == "BUY":
-            pnl = (exit_price - entry_price) * size
-            # Return proceeds from selling
-            proceeds = size * exit_price
+            pnl = (exit_price - entry_price) * shares
         else:
-            pnl = (entry_price - exit_price) * size
-            proceeds = size * exit_price
+            pnl = (entry_price - exit_price) * shares
+
+        # Proceeds = shares * exit_price (what we get back from selling)
+        proceeds = shares * exit_price
 
         # Update trade status, PnL, sell price, and closed timestamp
         conn.execute(
@@ -411,9 +476,8 @@ class Database:
         largest_win = row[10] or 0.0
         largest_loss = row[11] or 0.0
 
-        # Win rate calculation
-        total_closed_with_pnl = winning_trades + losing_trades
-        win_rate = (winning_trades / total_closed_with_pnl * 100) if total_closed_with_pnl > 0 else 0.0
+        # Win rate calculation (use all closed trades as denominator, including break-even)
+        win_rate = (winning_trades / closed_trades * 100) if closed_trades > 0 else 0.0
 
         return {
             "total_trades": total_trades,
@@ -430,3 +494,88 @@ class Database:
             "largest_loss": largest_loss,
             "win_rate": win_rate,
         }
+
+    def record_pnl_snapshot(
+        self,
+        our_pnl_pct: float,
+        whale_pnl_pct: float,
+        our_total_invested: float = 0.0,
+        whale_total_invested: float = 0.0,
+    ) -> None:
+        """Record a P&L snapshot for time-series comparison.
+
+        Args:
+            our_pnl_pct: Our P&L as percentage of invested capital
+            whale_pnl_pct: Whale's P&L as percentage of invested capital
+            our_total_invested: Our total invested amount (for context)
+            whale_total_invested: Whale's total invested amount (for context)
+        """
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO pnl_history (timestamp, our_pnl_pct, whale_pnl_pct, our_total_invested, whale_total_invested)
+               VALUES (?, ?, ?, ?, ?)""",
+            (datetime.now().isoformat(), our_pnl_pct, whale_pnl_pct, our_total_invested, whale_total_invested)
+        )
+        conn.commit()
+
+    def get_pnl_history(self, hours: int = 48) -> List[Dict[str, Any]]:
+        """Get P&L history for the last N hours.
+
+        Args:
+            hours: Number of hours of history to return (default 48)
+
+        Returns:
+            List of snapshots with timestamp, our_pnl_pct, whale_pnl_pct
+        """
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+        cursor = conn.execute(
+            """SELECT timestamp, our_pnl_pct, whale_pnl_pct, our_total_invested, whale_total_invested
+               FROM pnl_history
+               WHERE timestamp > ?
+               ORDER BY timestamp ASC""",
+            (cutoff,)
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.row_factory = None
+        return rows
+
+    def get_pnl_history_sampled(self, hours: int = 48, interval_hours: int = 5) -> List[Dict[str, Any]]:
+        """Get P&L history sampled at regular intervals.
+
+        Args:
+            hours: Total hours of history to return (default 48)
+            interval_hours: Interval between samples in hours (default 5)
+
+        Returns:
+            List of sampled snapshots, one per interval
+        """
+        all_history = self.get_pnl_history(hours)
+        if not all_history:
+            return []
+
+        # Sample at specified intervals
+        sampled = []
+        last_sample_time = None
+
+        for snapshot in all_history:
+            try:
+                snap_time = datetime.fromisoformat(snapshot['timestamp'])
+            except (ValueError, TypeError):
+                continue
+
+            if last_sample_time is None:
+                sampled.append(snapshot)
+                last_sample_time = snap_time
+            else:
+                delta = (snap_time - last_sample_time).total_seconds() / 3600
+                if delta >= interval_hours:
+                    sampled.append(snapshot)
+                    last_sample_time = snap_time
+
+        # Always include the most recent snapshot
+        if all_history and (not sampled or sampled[-1] != all_history[-1]):
+            sampled.append(all_history[-1])
+
+        return sampled

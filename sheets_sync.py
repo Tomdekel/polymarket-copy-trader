@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 TAB_PORTFOLIO = "Portfolio Summary"
 TAB_TARGET_POSITIONS = "Target Positions"
 TAB_OUR_TRADES = "Our Trades"
+TAB_COMPARISON = "Comparison"
 
 
 class GoogleSheetsSync:
@@ -69,7 +70,7 @@ class GoogleSheetsSync:
         existing_tabs = [ws.title for ws in sheet.worksheets()]
 
         # Create missing tabs
-        for tab_name in [TAB_PORTFOLIO, TAB_TARGET_POSITIONS, TAB_OUR_TRADES]:
+        for tab_name in [TAB_PORTFOLIO, TAB_TARGET_POSITIONS, TAB_OUR_TRADES, TAB_COMPARISON]:
             if tab_name not in existing_tabs:
                 sheet.add_worksheet(title=tab_name, rows=100, cols=10)
                 logger.info(f"Created sheet tab: {tab_name}")
@@ -83,16 +84,58 @@ class GoogleSheetsSync:
         return f"-${abs(value):,.2f}"
 
     def _format_pnl(self, value: float) -> str:
-        """Format PnL with + prefix for positive values."""
+        """Format PnL value.
+
+        Note: Don't use "+" prefix as Google Sheets USER_ENTERED mode
+        interprets it as a formula operator, causing #ERROR!.
+        """
         if value is None:
             return "$0.00"
         if value >= 0:
-            return f"+${value:,.2f}"
+            return f"${value:,.2f}"
         return f"-${abs(value):,.2f}"
 
     def _format_percentage(self, value: float) -> str:
         """Format value as percentage."""
         return f"{value:.2%}"
+
+    def _format_market_link(self, market_slug: str, market_id: str = "") -> str:
+        """Format market name as hyperlink to Polymarket.
+
+        Args:
+            market_slug: Human-readable market name/slug
+            market_id: Market ID (condition ID) - used if slug is empty
+
+        Returns:
+            Google Sheets hyperlink formula or plain text
+        """
+        # Clean up slug - treat 'None' string as empty
+        if market_slug in (None, 'None', ''):
+            market_slug = ""
+
+        # Use slug for display, fallback to truncated market_id
+        if market_slug:
+            display_name = market_slug
+        elif market_id:
+            display_name = market_id[:30] + "..." if len(market_id) > 30 else market_id
+        else:
+            return "Unknown"
+
+        # Escape quotes in display name for the formula
+        display_name_escaped = display_name.replace('"', '""')
+
+        # Build URL - use condition ID for reliable linking
+        # Polymarket URLs work with condition IDs: polymarket.com/event/[slug] or /markets/[conditionId]
+        if market_id:
+            url = f"https://polymarket.com/markets/{market_id}"
+        elif market_slug:
+            url_slug = market_slug.lower().replace(" ", "-")
+            url = f"https://polymarket.com/event/{url_slug}"
+        else:
+            return display_name
+
+        # Google Sheets HYPERLINK formula
+        return f'=HYPERLINK("{url}", "{display_name_escaped}")'
 
     def _format_duration(self, start_time: str) -> str:
         """Format duration since start time as 'Xh Ym' or 'Xd Yh'.
@@ -136,6 +179,7 @@ class GoogleSheetsSync:
         whale_profile_url: Optional[str] = None,
         session_started: Optional[str] = None,
         trade_stats: Optional[Dict[str, Any]] = None,
+        unrealized_pnl: Optional[float] = None,
     ) -> None:
         """Sync portfolio summary to the Portfolio Summary tab.
 
@@ -145,11 +189,12 @@ class GoogleSheetsSync:
             initial_budget: Initial budget amount
             current_value: Current portfolio value
             cash_available: Available cash balance
-            pnl_24h: Profit/loss in last 24 hours
-            pnl_total: Total profit/loss
+            pnl_24h: Profit/loss in last 24 hours (realized)
+            pnl_total: Total realized profit/loss (from closed trades only)
             whale_profile_url: URL to whale's Polymarket profile
             session_started: ISO timestamp when session started
             trade_stats: Dictionary of trade statistics from database
+            unrealized_pnl: Unrealized P&L from open positions (passed separately)
         """
         sheet = self._get_sheet()
         worksheet = sheet.worksheet(TAB_PORTFOLIO)
@@ -174,6 +219,15 @@ class GoogleSheetsSync:
         if allocated_in_deals < 0:
             allocated_in_deals = 0  # Handle edge case
 
+        # Use passed unrealized_pnl if provided, otherwise calculate as fallback
+        # pnl_total is ONLY realized P&L from closed trades
+        if unrealized_pnl is None:
+            # Fallback calculation (may be inaccurate)
+            unrealized_pnl = (current_value - initial_budget) - pnl_total
+
+        # Total P&L = unrealized + realized
+        total_pnl = unrealized_pnl + pnl_total
+
         data = [
             ["Field", "Value"],
             ["Whale Profile", whale_profile_url or f"https://polymarket.com/profile/{target_wallet}"],
@@ -186,8 +240,10 @@ class GoogleSheetsSync:
             ["Allocated in Deals", self._format_currency(allocated_in_deals)],
             ["Cash Available", self._format_currency(cash_available)],
             ["Current Value", self._format_currency(current_value)],
-            ["P&L (24h)", self._format_pnl(pnl_24h)],
-            ["P&L (Total)", self._format_pnl(pnl_total)],
+            ["Unrealized P&L", self._format_pnl(unrealized_pnl)],
+            ["Realized P&L (24h)", self._format_pnl(pnl_24h)],
+            ["Realized P&L (Total)", self._format_pnl(pnl_total)],
+            ["Total P&L", self._format_pnl(total_pnl)],
             ["Last Updated", updated_at],
         ]
 
@@ -203,9 +259,6 @@ class GoogleSheetsSync:
                 ["Total Bets", stats.get("total_trades", 0)],
                 ["Open Positions", stats.get("open_trades", 0)],
                 ["Closed Positions", stats.get("closed_trades", 0)],
-                ["", ""],
-                ["Total Buys", stats.get("total_buys", 0)],
-                ["Total Sells", stats.get("total_sells", 0)],
                 ["", ""],
                 ["Winning Trades", stats.get("winning_trades", 0)],
                 ["Losing Trades", stats.get("losing_trades", 0)],
@@ -228,7 +281,8 @@ class GoogleSheetsSync:
 
         Args:
             positions: List of target wallet positions with keys:
-                - market: Market identifier/slug
+                - market: Market identifier (UUID/condition ID)
+                - market_slug: Human-readable market name
                 - outcome: YES or NO
                 - size: Number of shares
                 - avg_price: Average entry price
@@ -239,46 +293,71 @@ class GoogleSheetsSync:
         sheet = self._get_sheet()
         worksheet = sheet.worksheet(TAB_TARGET_POSITIONS)
 
-        # Header row
-        headers = ["Market", "Outcome", "Size", "Avg Price", "Current Price", "Value", "P&L"]
+        # Header row - unified structure matching Our Trades
+        headers = ["Market", "Side", "Shares", "Cost Basis", "Current Value", "Entry Price", "Current Price", "P&L", "P&L %", "Status"]
         data = [headers]
 
         # Add position rows
         for pos in positions:
-            size = pos.get('size') or 0
+            shares = pos.get('size') or 0  # Number of shares
             avg_price = pos.get('avg_price') or 0
             current_price = pos.get('current_price') or 0
-            value = pos.get('value') or 0
+            value = pos.get('value') or 0  # Current market value
             pnl = pos.get('pnl') or 0
+            outcome = pos.get("outcome") or "YES"  # Side (YES/NO)
+            market_slug = pos.get("market_slug") or pos.get("market") or ""
+            market_id = pos.get("market") or ""
+
+            # Calculate cost basis = shares × avg_price
+            cost_basis = shares * avg_price
+
+            # Calculate P&L % based on cost basis
+            if cost_basis > 0:
+                pnl_pct = (pnl / cost_basis) * 100
+                pnl_pct_str = f"{pnl_pct:+.1f}%"
+            else:
+                pnl_pct_str = "-"
 
             row = [
-                pos.get("market") or pos.get("market_slug") or "Unknown",
-                pos.get("outcome") or "",
-                f"{size:.4f}",
-                f"{avg_price:.4f}",
-                f"{current_price:.4f}",
-                self._format_currency(value),
+                self._format_market_link(market_slug, market_id),
+                outcome,  # Side (YES/NO)
+                f"{shares:.4f}",  # Shares
+                self._format_currency(cost_basis),  # Cost Basis
+                self._format_currency(value),  # Current Value
+                f"{avg_price:.4f}",  # Entry Price
+                f"{current_price:.4f}",  # Current Price
                 self._format_pnl(pnl),
+                pnl_pct_str,
+                "open",  # Status
             ]
             data.append(row)
 
         # Clear and update in one batch
         worksheet.clear()
-        worksheet.update(range_name="A1", values=data)
+        worksheet.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
         logger.debug(f"Synced {len(positions)} target positions to Google Sheets")
 
-    def sync_our_trades(self, trades: List[Dict[str, Any]], max_trades: int = 500) -> None:
+    def sync_our_trades(
+        self,
+        trades: List[Dict[str, Any]],
+        target_positions: Optional[List[Dict[str, Any]]] = None,
+        max_trades: int = 500,
+    ) -> None:
         """Sync our trades to the Our Trades tab.
 
         Args:
             trades: List of our trades with keys:
                 - timestamp: Trade timestamp
-                - market: Market identifier
+                - market: Market identifier (UUID)
+                - market_slug: Human-readable market name
                 - side: BUY or SELL
                 - size: Trade size in USD
-                - price: Trade price
-                - pnl: Unrealized P&L (optional)
+                - price: Trade price (entry)
+                - current_price: Current market price (for open trades)
+                - sell_price: Exit price (for closed trades)
+                - pnl: P&L (unrealized for open, realized for closed)
                 - status: Trade status (open/closed)
+            target_positions: Target wallet positions to lookup missing market slugs
             max_trades: Maximum number of recent trades to sync (default: 500)
         """
         # Limit to most recent trades to avoid memory issues
@@ -286,56 +365,520 @@ class GoogleSheetsSync:
         sheet = self._get_sheet()
         worksheet = sheet.worksheet(TAB_OUR_TRADES)
 
-        # Header row
-        headers = ["Opened", "Market", "Size", "Buy Price", "Sell Price", "P&L", "Closed", "Status"]
+        # Create slug lookup from target positions for backfilling missing slugs
+        slug_lookup: Dict[str, str] = {}
+        if target_positions:
+            for pos in target_positions:
+                market_id = pos.get("market", "")
+                slug = pos.get("market_slug", "")
+                if market_id and slug:
+                    slug_lookup[market_id] = slug
+
+        # Header row - unified structure for true comparison
+        headers = ["Market", "Side", "Shares", "Cost Basis", "Current Value", "Entry Price", "Current Price", "P&L", "P&L %", "Status"]
         data = [headers]
 
         # Add trade rows
         for trade in trades:
-            # Format open timestamp
-            open_timestamp = trade.get("timestamp", "")
-            if isinstance(open_timestamp, str) and "T" in open_timestamp:
-                try:
-                    dt = datetime.fromisoformat(open_timestamp)
-                    open_timestamp = dt.strftime("%Y-%m-%d %H:%M")
-                except ValueError:
-                    pass
-
-            # Format close timestamp
-            close_timestamp = trade.get("closed_at", "")
-            if isinstance(close_timestamp, str) and "T" in close_timestamp:
-                try:
-                    dt = datetime.fromisoformat(close_timestamp)
-                    close_timestamp = dt.strftime("%Y-%m-%d %H:%M")
-                except ValueError:
-                    pass
-            if not close_timestamp:
-                close_timestamp = "-"
-
+            status = trade.get("status") or "open"
             pnl = trade.get("pnl")
+
+            size = trade.get("size") or 0  # USD invested (cost basis)
+            entry_price = trade.get("price") or 0
+            market_id = trade.get("market") or ""
+
+            # Use slug from trade, or look up from target positions
+            market_slug = trade.get("market_slug") or ""
+            if not market_slug and market_id in slug_lookup:
+                market_slug = slug_lookup[market_id]
+
+            # Use outcome from trade record (YES/NO), fallback to YES for legacy trades
+            side = trade.get("outcome") or "YES"
+
+            # Calculate shares from cost basis
+            shares = size / entry_price if entry_price > 0 else 0
+
+            # For closed trades, use sell_price as current price
+            # For open trades, use current_price (updated in real-time)
+            if status == "closed":
+                current_price = trade.get("sell_price") or entry_price
+            else:
+                current_price = trade.get("current_price") or entry_price
+
+            # Calculate current value
+            current_value = shares * current_price
+
+            # Format P&L
             pnl_str = self._format_pnl(pnl) if pnl is not None else "-"
 
-            size = trade.get("size") or 0
-            buy_price = trade.get("price") or 0
-            sell_price = trade.get("sell_price")
-            sell_price_str = f"{sell_price:.4f}" if sell_price is not None else "-"
+            # Calculate P&L % based on cost basis
+            if size > 0 and pnl is not None:
+                pnl_pct = (pnl / size) * 100
+                pnl_pct_str = f"{pnl_pct:+.1f}%"
+            else:
+                pnl_pct_str = "-"
 
             row = [
-                open_timestamp,
-                trade.get("market") or "Unknown",
-                self._format_currency(size),
-                f"{buy_price:.4f}",
-                sell_price_str,
+                self._format_market_link(market_slug, market_id),
+                side,
+                f"{shares:.4f}",
+                self._format_currency(size),  # Cost basis
+                self._format_currency(current_value),
+                f"{entry_price:.4f}",
+                f"{current_price:.4f}",
                 pnl_str,
-                close_timestamp,
-                trade.get("status") or "open",
+                pnl_pct_str,
+                status,
             ]
             data.append(row)
 
         # Clear and update in one batch
         worksheet.clear()
-        worksheet.update(range_name="A1", values=data)
+        worksheet.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
         logger.debug(f"Synced {len(trades)} trades to Google Sheets")
+
+    def sync_comparison(
+        self,
+        target_positions: List[Dict[str, Any]],
+        our_trades: List[Dict[str, Any]],
+        trade_stats: Optional[Dict[str, Any]] = None,
+        pnl_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Sync comparison analysis to the Comparison tab.
+
+        Focuses on SHARED markets only to evaluate copy trading viability.
+        Includes a P&L % over time comparison chart.
+
+        Args:
+            target_positions: List of target wallet positions
+            our_trades: List of our trades (open positions only for comparison)
+            trade_stats: Trade statistics from database
+            pnl_history: P&L history snapshots for time-series chart
+        """
+        sheet = self._get_sheet()
+        worksheet = sheet.worksheet(TAB_COMPARISON)
+
+        # Filter to only open trades for our positions
+        our_open = [t for t in our_trades if t.get("status") == "open"]
+
+        # Build market lookups (keyed by market UUID)
+        target_by_market = {pos.get("market"): pos for pos in target_positions if pos.get("market")}
+        our_by_market = {t.get("market"): t for t in our_open if t.get("market")}
+
+        target_markets = set(target_by_market.keys())
+        our_markets = set(our_by_market.keys())
+        shared_markets = target_markets & our_markets
+        missing_from_us = target_markets - our_markets
+        extra_positions = our_markets - target_markets
+
+        data = []
+
+        # ============================================================
+        # Section 1: SHARED POSITIONS ANALYSIS (only markets both have)
+        # ============================================================
+        data.append(["=== SHARED POSITIONS ANALYSIS ===", "", "", ""])
+        data.append(["(Only markets where we copied the whale)", "", "", ""])
+        data.append(["", "", "", ""])
+
+        if shared_markets:
+            # Calculate totals for shared markets only
+            shared_target_invested = 0.0
+            shared_target_value = 0.0
+            shared_target_pnl = 0.0
+            shared_our_invested = 0.0
+            shared_our_value = 0.0
+            shared_our_pnl = 0.0
+            shared_target_winners = 0
+            shared_our_winners = 0
+            entry_price_diffs = []
+
+            for market in shared_markets:
+                target_pos = target_by_market[market]
+                our_pos = our_by_market[market]
+
+                # Target calculations
+                t_shares = target_pos.get("size") or 0
+                t_avg_price = target_pos.get("avg_price") or 0
+                t_value = target_pos.get("value") or 0
+                t_pnl = target_pos.get("pnl") or 0
+                t_cost = t_shares * t_avg_price
+                shared_target_invested += t_cost
+                shared_target_value += t_value
+                shared_target_pnl += t_pnl
+                if t_pnl > 0:
+                    shared_target_winners += 1
+
+                # Our calculations
+                o_cost = our_pos.get("size") or 0  # cost basis
+                o_entry_price = our_pos.get("price") or 0
+                o_current_price = our_pos.get("current_price") or o_entry_price
+                o_pnl = our_pos.get("pnl") or 0
+                o_shares = o_cost / o_entry_price if o_entry_price > 0 else 0
+                o_value = o_shares * o_current_price
+                shared_our_invested += o_cost
+                shared_our_value += o_value
+                shared_our_pnl += o_pnl
+                if o_pnl > 0:
+                    shared_our_winners += 1
+
+                # Entry price comparison (slippage)
+                if t_avg_price > 0:
+                    entry_diff_pct = ((o_entry_price - t_avg_price) / t_avg_price) * 100
+                    entry_price_diffs.append(entry_diff_pct)
+
+            # Calculate P&L percentages
+            target_pnl_pct = (shared_target_pnl / shared_target_invested * 100) if shared_target_invested > 0 else 0
+            our_pnl_pct = (shared_our_pnl / shared_our_invested * 100) if shared_our_invested > 0 else 0
+            target_win_pct = (shared_target_winners / len(shared_markets) * 100) if shared_markets else 0
+            our_win_pct = (shared_our_winners / len(shared_markets) * 100) if shared_markets else 0
+            avg_slippage = sum(entry_price_diffs) / len(entry_price_diffs) if entry_price_diffs else 0
+
+            data.append(["Metric", "Target (Whale)", "Ours", "Difference"])
+            data.append([
+                "Shared Positions",
+                len(shared_markets),
+                len(shared_markets),
+                "0 (same markets)",
+            ])
+            data.append([
+                "Total Invested",
+                self._format_currency(shared_target_invested),
+                self._format_currency(shared_our_invested),
+                self._format_pnl(shared_our_invested - shared_target_invested),
+            ])
+            data.append([
+                "Current Value",
+                self._format_currency(shared_target_value),
+                self._format_currency(shared_our_value),
+                self._format_pnl(shared_our_value - shared_target_value),
+            ])
+            data.append([
+                "Total P&L ($)",
+                self._format_pnl(shared_target_pnl),
+                self._format_pnl(shared_our_pnl),
+                self._format_pnl(shared_our_pnl - shared_target_pnl),
+            ])
+            data.append([
+                "Total P&L (%)",
+                f"{target_pnl_pct:+.1f}%",
+                f"{our_pnl_pct:+.1f}%",
+                f"{our_pnl_pct - target_pnl_pct:+.1f}%",
+            ])
+            data.append([
+                "Winning Positions",
+                f"{shared_target_winners} ({target_win_pct:.0f}%)",
+                f"{shared_our_winners} ({our_win_pct:.0f}%)",
+                f"{shared_our_winners - shared_target_winners}",
+            ])
+            data.append([
+                "Avg Entry Slippage",
+                "-",
+                f"{avg_slippage:+.2f}%",
+                "(vs whale entry price)",
+            ])
+        else:
+            data.append(["No shared positions yet - need to copy some trades first", "", "", ""])
+
+        data.append(["", "", "", ""])
+
+        # ============================================================
+        # Section 2: PER-MARKET COMPARISON (shared markets only)
+        # ============================================================
+        data.append(["=== PER-MARKET COMPARISON (Shared Only) ===", "", "", "", "", "", "", "", "", ""])
+        data.append([
+            "Market",
+            "Side",
+            "Target Entry",
+            "Our Entry",
+            "Entry Diff",
+            "Target P&L",
+            "Our P&L",
+            "P&L Diff",
+            "Target P&L%",
+            "Our P&L%",
+        ])
+
+        for market in sorted(shared_markets):
+            target_pos = target_by_market[market]
+            our_pos = our_by_market[market]
+
+            # Target data
+            t_side = target_pos.get("outcome", "YES")
+            t_avg_price = target_pos.get("avg_price") or 0
+            t_shares = target_pos.get("size") or 0
+            t_pnl = target_pos.get("pnl") or 0
+            t_cost = t_shares * t_avg_price
+            t_pnl_pct = (t_pnl / t_cost * 100) if t_cost > 0 else 0
+
+            # Our data - use outcome from trade record, fallback to YES
+            o_side = our_pos.get("outcome") or "YES"
+            o_entry_price = our_pos.get("price") or 0
+            o_cost = our_pos.get("size") or 0
+            o_pnl = our_pos.get("pnl") or 0
+            o_pnl_pct = (o_pnl / o_cost * 100) if o_cost > 0 else 0
+
+            # Entry price difference
+            if t_avg_price > 0:
+                entry_diff = ((o_entry_price - t_avg_price) / t_avg_price) * 100
+                entry_diff_str = f"{entry_diff:+.2f}%"
+            else:
+                entry_diff_str = "-"
+
+            # Get market_slug for display
+            market_slug = target_pos.get("market_slug", "") or our_pos.get("market_slug", "")
+            market_display = self._format_market_link(market_slug, market)
+
+            data.append([
+                market_display,
+                f"{t_side} / {o_side}",
+                f"{t_avg_price:.4f}",
+                f"{o_entry_price:.4f}",
+                entry_diff_str,
+                self._format_pnl(t_pnl),
+                self._format_pnl(o_pnl),
+                self._format_pnl(o_pnl - t_pnl),
+                f"{t_pnl_pct:+.1f}%",
+                f"{o_pnl_pct:+.1f}%",
+            ])
+
+        if not shared_markets:
+            data.append(["No shared positions to compare", "", "", "", "", "", "", "", "", ""])
+
+        data.append(["", "", "", "", "", "", "", "", "", ""])
+
+        # ============================================================
+        # Section 3: POSITION GAPS (informational)
+        # ============================================================
+        data.append(["=== POSITION GAPS ===", "", "", ""])
+        data.append(["", "", "", ""])
+
+        # Markets target has that we don't (missed opportunities)
+        data.append([f"MISSED OPPORTUNITIES (whale has, we don't): {len(missing_from_us)}", "", "", ""])
+        if missing_from_us:
+            data.append(["Market", "Side", "Value", "P&L"])
+            for market in sorted(missing_from_us):
+                target_pos = target_by_market.get(market)
+                value = target_pos.get("value", 0) if target_pos else 0
+                pnl = target_pos.get("pnl", 0) if target_pos else 0
+                side = target_pos.get("outcome", "") if target_pos else ""
+                market_slug = target_pos.get("market_slug", "") if target_pos else ""
+                market_link = self._format_market_link(market_slug, market)
+                data.append([market_link, side, self._format_currency(value), self._format_pnl(pnl)])
+        else:
+            data.append(["None - we have all whale positions!", "", "", ""])
+
+        data.append(["", "", "", ""])
+
+        # Markets we have that target doesn't (shouldn't happen if copying)
+        data.append([f"EXTRA POSITIONS (we have, whale doesn't): {len(extra_positions)}", "", "", ""])
+        if extra_positions:
+            data.append(["Market", "Side", "Cost Basis", "P&L"])
+            for market in sorted(extra_positions):
+                our_pos = our_by_market.get(market)
+                cost = our_pos.get("size", 0) if our_pos else 0
+                pnl = our_pos.get("pnl", 0) if our_pos else 0
+                side = our_pos.get("outcome", "YES") if our_pos else "YES"
+                market_slug = our_pos.get("market_slug", "") if our_pos else ""
+                market_link = self._format_market_link(market_slug, market)
+                data.append([market_link, side, self._format_currency(cost), self._format_pnl(pnl)])
+        else:
+            data.append(["None - all our positions are copies!", "", "", ""])
+
+        data.append(["", "", "", ""])
+
+        # ============================================================
+        # Section 4: STRATEGY VIABILITY SUMMARY
+        # ============================================================
+        data.append(["=== STRATEGY VIABILITY SUMMARY ===", "", ""])
+        data.append(["Metric", "Value", "Interpretation"])
+
+        # Coverage
+        coverage = len(shared_markets) / len(target_markets) * 100 if target_markets else 0
+        if coverage >= 80:
+            coverage_interp = "Excellent - copying most trades"
+        elif coverage >= 50:
+            coverage_interp = "Good - copying majority"
+        elif coverage >= 20:
+            coverage_interp = "Moderate - missing many opportunities"
+        else:
+            coverage_interp = "Poor - barely copying"
+        data.append([
+            "Coverage",
+            f"{len(shared_markets)}/{len(target_markets)} ({coverage:.0f}%)",
+            coverage_interp,
+        ])
+
+        # Entry slippage
+        if shared_markets:
+            entry_price_diffs = []
+            for market in shared_markets:
+                target_pos = target_by_market[market]
+                our_pos = our_by_market[market]
+                t_avg_price = target_pos.get("avg_price") or 0
+                o_entry_price = our_pos.get("price") or 0
+                if t_avg_price > 0:
+                    entry_diff_pct = ((o_entry_price - t_avg_price) / t_avg_price) * 100
+                    entry_price_diffs.append(entry_diff_pct)
+            avg_slippage = sum(entry_price_diffs) / len(entry_price_diffs) if entry_price_diffs else 0
+
+            if abs(avg_slippage) < 2:
+                slippage_interp = "Excellent - nearly identical entries"
+            elif abs(avg_slippage) < 5:
+                slippage_interp = "Good - minor timing differences"
+            elif abs(avg_slippage) < 10:
+                slippage_interp = "Moderate - noticeable slippage"
+            else:
+                slippage_interp = "Poor - significant entry disadvantage"
+            data.append([
+                "Avg Entry Slippage",
+                f"{avg_slippage:+.2f}%",
+                slippage_interp,
+            ])
+
+            # Performance vs whale (on shared positions)
+            shared_target_pnl = sum(target_by_market[m].get("pnl", 0) for m in shared_markets)
+            shared_our_pnl = sum(our_by_market[m].get("pnl", 0) or 0 for m in shared_markets)
+            perf_diff = shared_our_pnl - shared_target_pnl
+
+            if perf_diff > 0:
+                perf_interp = "Outperforming whale!"
+            elif perf_diff > -10:
+                perf_interp = "Tracking whale closely"
+            elif perf_diff > -50:
+                perf_interp = "Lagging whale moderately"
+            else:
+                perf_interp = "Significantly underperforming"
+            data.append([
+                "Performance vs Whale",
+                self._format_pnl(perf_diff),
+                perf_interp,
+            ])
+
+            # Overall viability
+            if coverage >= 50 and abs(avg_slippage) < 5:
+                viability = "VIABLE - Good copy trading setup"
+            elif coverage >= 30 or abs(avg_slippage) < 10:
+                viability = "MODERATE - Consider improving coverage/timing"
+            else:
+                viability = "REVIEW NEEDED - Coverage or slippage issues"
+            data.append([
+                "Overall Viability",
+                viability,
+                "",
+            ])
+        else:
+            data.append(["Avg Entry Slippage", "N/A", "No shared positions yet"])
+            data.append(["Performance vs Whale", "N/A", "No shared positions yet"])
+            data.append(["Overall Viability", "PENDING", "Need to copy some trades first"])
+
+        data.append(["", "", ""])
+
+        # ============================================================
+        # Section 5: P&L % OVER TIME CHART
+        # ============================================================
+        data.append(["=== P&L % OVER TIME (5-hour intervals) ===", "", "", "", ""])
+        data.append(["", "", "", "", ""])
+
+        if pnl_history and len(pnl_history) >= 2:
+            # Chart data header
+            data.append(["Time", "Our P&L %", "Whale P&L %", "Difference", ""])
+
+            # Add chart data rows
+            chart_data_start_row = len(data) + 1  # 1-indexed for Sheets
+            our_pnl_values = []
+            whale_pnl_values = []
+
+            for snapshot in pnl_history:
+                try:
+                    ts = datetime.fromisoformat(snapshot['timestamp'])
+                    time_str = ts.strftime("%m/%d %H:%M")
+                except (ValueError, TypeError):
+                    time_str = "Unknown"
+
+                our_pnl = snapshot.get('our_pnl_pct') or 0
+                whale_pnl = snapshot.get('whale_pnl_pct') or 0
+                diff = our_pnl - whale_pnl
+
+                our_pnl_values.append(our_pnl)
+                whale_pnl_values.append(whale_pnl)
+
+                data.append([
+                    time_str,
+                    f"{our_pnl:+.2f}%",
+                    f"{whale_pnl:+.2f}%",
+                    f"{diff:+.2f}%",
+                    "",
+                ])
+
+            chart_data_end_row = len(data)
+
+            data.append(["", "", "", "", ""])
+
+            # Add SPARKLINE formulas for visual chart (inline mini-charts)
+            # SPARKLINE shows a small line chart in a single cell
+            if len(our_pnl_values) >= 2:
+                data.append(["Our P&L Trend:", f'=SPARKLINE(B{chart_data_start_row}:B{chart_data_end_row}, {{"charttype","line";"color","green"}})', "", "", ""])
+                data.append(["Whale P&L Trend:", f'=SPARKLINE(C{chart_data_start_row}:C{chart_data_end_row}, {{"charttype","line";"color","blue"}})', "", "", ""])
+                data.append(["", "", "", "", ""])
+
+                # Summary statistics for the chart period
+                data.append(["Chart Period Summary:", "", "", "", ""])
+                data.append([
+                    "Data Points",
+                    len(pnl_history),
+                    "",
+                    "",
+                    "",
+                ])
+
+                # Calculate trends
+                if len(our_pnl_values) >= 2:
+                    our_change = our_pnl_values[-1] - our_pnl_values[0]
+                    whale_change = whale_pnl_values[-1] - whale_pnl_values[0]
+                    our_trend = "📈" if our_change > 0 else "📉" if our_change < 0 else "➡️"
+                    whale_trend = "📈" if whale_change > 0 else "📉" if whale_change < 0 else "➡️"
+
+                    data.append([
+                        "Our Trend",
+                        f"{our_trend} {our_change:+.2f}% over period",
+                        "",
+                        "",
+                        "",
+                    ])
+                    data.append([
+                        "Whale Trend",
+                        f"{whale_trend} {whale_change:+.2f}% over period",
+                        "",
+                        "",
+                        "",
+                    ])
+
+                    # Are we converging or diverging from whale?
+                    initial_gap = our_pnl_values[0] - whale_pnl_values[0]
+                    final_gap = our_pnl_values[-1] - whale_pnl_values[-1]
+                    if abs(final_gap) < abs(initial_gap):
+                        convergence = "Converging (closing the gap)"
+                    elif abs(final_gap) > abs(initial_gap):
+                        convergence = "Diverging (gap widening)"
+                    else:
+                        convergence = "Stable (gap unchanged)"
+
+                    data.append([
+                        "Tracking Status",
+                        convergence,
+                        "",
+                        "",
+                        "",
+                    ])
+        else:
+            data.append(["Insufficient data for chart", "", "", "", ""])
+            data.append(["(Need at least 2 data points, collected every sync cycle)", "", "", "", ""])
+            data.append(["", "", "", "", ""])
+
+        # Clear and update in one batch (USER_ENTERED to parse HYPERLINK formulas and SPARKLINE)
+        worksheet.clear()
+        worksheet.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
+        logger.debug("Synced comparison data to Google Sheets")
 
     def sync_all(
         self,
@@ -344,6 +887,8 @@ class GoogleSheetsSync:
         target_positions: List[Any],
         our_trades: List[Dict[str, Any]],
         trade_stats: Optional[Dict[str, Any]] = None,
+        unrealized_pnl: Optional[float] = None,
+        pnl_history: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """Sync all data to Google Sheets.
 
@@ -353,6 +898,8 @@ class GoogleSheetsSync:
             target_positions: Target wallet positions (Position dataclass instances or dicts)
             our_trades: Our trade records from database
             trade_stats: Trade statistics from database (optional)
+            unrealized_pnl: Unrealized P&L from open positions (calculated separately)
+            pnl_history: P&L history snapshots for time-series chart
 
         Returns:
             True if sync was successful, False otherwise
@@ -393,6 +940,7 @@ class GoogleSheetsSync:
                 whale_profile_url=whale_profile_url,
                 session_started=session_started,
                 trade_stats=trade_stats,
+                unrealized_pnl=unrealized_pnl,
             )
 
             # Convert Position dataclass instances to dicts if needed
@@ -401,7 +949,8 @@ class GoogleSheetsSync:
                 if hasattr(pos, "__dict__"):
                     # It's a dataclass or object with attributes
                     pos_dict = {
-                        "market": getattr(pos, "market_slug", None) or getattr(pos, "market", "Unknown"),
+                        "market": getattr(pos, "market", ""),  # UUID/condition ID
+                        "market_slug": getattr(pos, "market_slug", ""),  # Human-readable name
                         "outcome": getattr(pos, "outcome", ""),
                         "size": getattr(pos, "size", 0),
                         "avg_price": getattr(pos, "avg_price", 0),
@@ -416,8 +965,11 @@ class GoogleSheetsSync:
             # Sync target positions
             self.sync_target_positions(target_pos_dicts)
 
-            # Sync our trades
-            self.sync_our_trades(our_trades)
+            # Sync our trades (pass target positions for slug lookup)
+            self.sync_our_trades(our_trades, target_pos_dicts)
+
+            # Sync comparison analysis
+            self.sync_comparison(target_pos_dicts, our_trades, trade_stats, pnl_history)
 
             with self._lock:
                 self._last_sync = datetime.now()

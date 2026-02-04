@@ -140,24 +140,39 @@ def copy(ctx, wallet: str, budget: float, dry_run: bool, health_port: int):
                 continue
 
             # Create price lookup from target positions (avoids failing API call)
-            # Also store outcome for fallback price fetching
+            # Also store outcome and slug for fallback price fetching and display
             price_map = {pos.market: pos.current_price for pos in target_positions}
             outcome_map = {pos.market: pos.outcome for pos in target_positions}
+            slug_map = {pos.market: pos.market_slug for pos in target_positions}
 
             # Get our current positions and portfolio stats
             our_positions = db.get_open_positions()
             portfolio_stats = db.get_portfolio_stats()
 
-            # Calculate current PnL from open positions
-            current_pnl = sum(p.get('pnl', 0) or 0 for p in our_positions)
-            current_pnl += portfolio_stats.get('pnl_total', 0)
-            risk_check = risk_mgr.check_risk(current_pnl)
+            # Update P&L for all our open positions using current prices
+            for position in our_positions:
+                market_id = position.get('market')
+                current_price = price_map.get(market_id)
+                if current_price is not None:  # Use 'is not None' to handle 0.0 price
+                    db.update_trade_pnl(position['id'], current_price)
+
+            # Re-fetch positions to get updated P&L values
+            our_positions = db.get_open_positions()
+
+            # Calculate P&L separately - DO NOT combine unrealized with pnl_total
+            # Unrealized P&L = sum of open position P&L (paper gains/losses)
+            unrealized_pnl = sum(p.get('pnl', 0) or 0 for p in our_positions)
+            # Realized P&L = pnl_total from database (only from closed trades)
+            realized_pnl = portfolio_stats.get('pnl_total', 0)
+            # Total P&L for risk check (but NOT stored back as pnl_total)
+            total_pnl_for_risk = unrealized_pnl + realized_pnl
+            risk_check = risk_mgr.check_risk(total_pnl_for_risk)
 
             if not risk_check['allow_trade']:
                 logger.warning(f"Risk halt: {risk_check['reason']}")
                 notifier.send_risk_alert(
                     reason=risk_check['reason'],
-                    current_pnl=current_pnl,
+                    current_pnl=total_pnl_for_risk,
                     daily_pnl=db.calculate_24h_pnl(),
                 )
                 shutdown_event.wait(check_interval)
@@ -207,13 +222,15 @@ def copy(ctx, wallet: str, budget: float, dry_run: bool, health_port: int):
                         current_price = 0.5
 
                     if pos.action == "BUY":
-                        # Record new buy position
+                        # Record new buy position with outcome from target
                         db.add_trade(
                             market=pos.market,
                             side=pos.action,
                             size=pos.our_size,
                             price=current_price,
-                            target_wallet=wallet
+                            target_wallet=wallet,
+                            market_slug=slug_map.get(pos.market, ""),
+                            outcome=outcome_map.get(pos.market, "YES"),
                         )
                     elif pos.action == "SELL":
                         # Close existing position and realize PnL
@@ -237,10 +254,55 @@ def copy(ctx, wallet: str, budget: float, dry_run: bool, health_port: int):
 
             # Update portfolio stats
             cash_balance = db.get_cash_balance()
-            positions_value = sum(p.get('size', 0) * p.get('price', 1) for p in our_positions)
-            total_value = cash_balance + positions_value
+
+            # Calculate current market value of positions (not just cost basis)
+            # shares = size / entry_price, current_value = shares * current_price
+            positions_current_value = 0.0
+            for p in our_positions:
+                size = p.get('size', 0)
+                entry_price = p.get('price', 0)
+                current_price = p.get('current_price') or entry_price  # fallback to entry if no current
+                if entry_price > 0:
+                    shares = size / entry_price
+                    positions_current_value += shares * current_price
+                else:
+                    positions_current_value += size  # fallback to cost basis
+
+            # In dry run mode, cash isn't deducted, so we need to calculate
+            # the hypothetical portfolio value correctly
+            positions_cost_basis = sum(p.get('size', 0) for p in our_positions)
+            if dry_run:
+                # Hypothetical cash = initial budget - what we "spent" on positions
+                hypothetical_cash = config.get('starting_budget', 10000) - positions_cost_basis
+                total_value = hypothetical_cash + positions_current_value
+            else:
+                total_value = cash_balance + positions_current_value
             pnl_24h = db.calculate_24h_pnl()
-            db.update_portfolio(total_value, cash_balance, pnl_24h, current_pnl)
+            # Note: Only pass realized_pnl to update_portfolio, NOT combined total
+            # The pnl_total in database should only contain realized P&L from closed trades
+            # Unrealized P&L is calculated dynamically from open positions
+            db.update_portfolio(total_value, cash_balance, pnl_24h, realized_pnl)
+
+            # Calculate P&L % for both us and whale for time-series tracking
+            # Our P&L % based on positions cost basis
+            our_total_invested = positions_cost_basis
+            our_pnl_pct = (unrealized_pnl / our_total_invested * 100) if our_total_invested > 0 else 0
+
+            # Whale P&L % from target positions
+            whale_total_invested = sum(
+                (p.size * p.avg_price) for p in target_positions
+                if p.avg_price and p.size
+            )
+            whale_total_pnl = sum(p.pnl or 0 for p in target_positions)
+            whale_pnl_pct = (whale_total_pnl / whale_total_invested * 100) if whale_total_invested > 0 else 0
+
+            # Record P&L snapshot for time-series comparison
+            db.record_pnl_snapshot(
+                our_pnl_pct=our_pnl_pct,
+                whale_pnl_pct=whale_pnl_pct,
+                our_total_invested=our_total_invested,
+                whale_total_invested=whale_total_invested,
+            )
 
             # Sync to Google Sheets dashboard
             if sheets_sync:
@@ -250,6 +312,8 @@ def copy(ctx, wallet: str, budget: float, dry_run: bool, health_port: int):
                     target_positions=target_positions,
                     our_trades=db.get_recent_trades(limit=100),
                     trade_stats=db.get_trade_statistics(),
+                    unrealized_pnl=unrealized_pnl,
+                    pnl_history=db.get_pnl_history_sampled(hours=48, interval_hours=5),
                 )
 
             # Update health status
