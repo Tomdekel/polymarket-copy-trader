@@ -200,13 +200,42 @@ gs://tombot-485015-mm-experiments/
 - Exposure limits violated → check quoting logic
 - Reconciliation fails → check P&L accounting in `pnl.py`
 
-## G) Next Safe Iterations
+## G) Probabilistic Fill Model (Implemented)
+
+The pluggable fill model system was added in commit `4e87ed0`. Two models:
+
+- **`strict`** (default): Original deterministic crossing — fill iff `last_trade_price` crosses quote. Produces 0 fills online because CLOB book structure doesn't match.
+- **`probabilistic`**: `p = min(p_max, base_liquidity * exp(-alpha * dist_ticks))` where `dist_ticks = abs(quote - ref) / tick_size`. Deterministic given `--seed`.
+
+### CLI flags
+```
+--fill-model probabilistic  # or strict (default)
+--seed 42                   # RNG seed for reproducibility
+--fill-alpha 1.5            # exponential decay rate
+--fill-pmax 0.20            # max per-step fill probability
+--fill-base-liquidity 0.10  # base liquidity parameter
+```
+
+### Calibration
+```bash
+python scripts/calibrate_fill_model.py --fixture-dir fixtures/market_making/sample --k-ticks 2
+```
+
+### Online results (2026-02-06)
+| Run | Fill Model | k-ticks | Runtime | Markets | Fills | Acceptance |
+|-----|-----------|---------|---------|---------|-------|------------|
+| `mm-20260206T020928-c0693f` | strict | 0 | 10 min | 5 | 0 | PASS |
+| `mm-20260206T021950-c80184` | probabilistic | 2 | 30 min | 10 | 24 | PASS |
+
+Artifacts: `gs://tombot-485015-mm-experiments/online-run-prob-fill-20260206T025253Z/`
+
+## H) Next Safe Iterations
 
 1. **Record larger fixtures:** Use `scripts/record_polymarket_fixture.py` to capture 10+ markets x 100+ snapshots from live API, then run offline with realistic data.
 
-2. **Probabilistic fill simulation:** Modify `poll_fills()` to simulate fills probabilistically when `last_trade_price` is near our quote price (e.g., within 1 tick), rather than requiring exact match.
+2. **Tune fill model parameters:** Use `scripts/calibrate_fill_model.py` against larger fixtures. Current defaults (alpha=1.5, base_liq=0.10, p_max=0.20) produce ~4% fill rate offline.
 
-3. **Longer online runs:** Increase `--max-runtime-min` to 120+ on a larger VM to catch more price movements and potential fills.
+3. **Longer online runs:** Increase `--max-runtime-min` to 120+ on a larger VM to accumulate more fills and test P&L accounting under load.
 
 4. **Add intermediate logging:** Modify the runner to log quote decisions and snapshot data every N iterations for debugging.
 
