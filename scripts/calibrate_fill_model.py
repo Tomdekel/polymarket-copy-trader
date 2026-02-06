@@ -52,10 +52,9 @@ def _run_sweep(
     now = datetime.now(UTC)
 
     for market_id in market_ids:
-        # Reset fixture index for this sweep.
-        provider._snapshot_idx[market_id] = 0
-        snapshots = provider._load_snapshots(market_id)
-        for _ in range(len(snapshots)):
+        provider.reset_market(market_id)
+        num_snapshots = provider.snapshot_count(market_id)
+        for _ in range(num_snapshots):
             snap = provider.get_snapshot(market_id, outcome="YES", advance=True)
             mid = compute_mid(snap.best_bid, snap.best_ask, snap.mid_price)
             if mid is None:

@@ -136,6 +136,14 @@ class ProbabilisticFillModel:
         p_max: float = 0.20,
         seed: int = 42,
     ):
+        if tick_size < 1e-10:
+            raise ValueError(f"tick_size must be >= 1e-10, got {tick_size}")
+        if alpha <= 0:
+            raise ValueError(f"alpha must be positive, got {alpha}")
+        if not (0 < base_liquidity <= 1):
+            raise ValueError(f"base_liquidity must be in (0, 1], got {base_liquidity}")
+        if not (0 < p_max <= 1):
+            raise ValueError(f"p_max must be in (0, 1], got {p_max}")
         self.tick_size = tick_size
         self.alpha = alpha
         self.base_liquidity = base_liquidity

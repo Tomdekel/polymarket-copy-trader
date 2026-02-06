@@ -141,6 +141,15 @@ class FixtureProvider:
         self._snapshot_idx[market_id] = 0
         return rows
 
+    def reset_market(self, market_id: str) -> None:
+        """Reset fixture index for a market back to the beginning."""
+        if market_id in self._snapshot_idx:
+            self._snapshot_idx[market_id] = 0
+
+    def snapshot_count(self, market_id: str) -> int:
+        """Return number of snapshots available for a market."""
+        return len(self._load_snapshots(market_id))
+
     def get_snapshot(self, market_id: str, outcome: str = "YES", advance: bool = True) -> MarketSnapshot:
         rows = self._load_snapshots(market_id)
         idx = self._snapshot_idx.get(market_id, 0)
