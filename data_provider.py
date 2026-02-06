@@ -18,14 +18,28 @@ class DataProvider(Protocol):
 
 
 class PolymarketAPIProvider:
+    """Online data provider using Gamma + CLOB APIs.
+
+    The CLOB order book often has extreme resting orders (0.01 bid / 0.99 ask)
+    far from the actual market price.  When the book-derived spread exceeds a
+    threshold we fall back to ``last_trade_price`` as the mid and derive
+    synthetic bid/ask around it so the quoting engine gets usable numbers.
+    """
+
+    _SPREAD_SANITY_THRESHOLD = 0.50  # 50 % — anything wider is stale book
+
     def __init__(self, client: Optional[GammaAPIClient] = None):
         self._client = client or GammaAPIClient()
+        self._market_cache: Dict[str, Dict[str, Any]] = {}
 
     def get_markets(self) -> List[Dict[str, Any]]:
         result = self._client.get_markets(active=True, closed=False)
-        if isinstance(result, list):
-            return result
-        return result.get("markets", [])
+        markets = result if isinstance(result, list) else result.get("markets", [])
+        for m in markets:
+            cid = m.get("conditionId")
+            if cid:
+                self._market_cache[cid] = m
+        return markets
 
     def get_snapshot(self, market_id: str, outcome: str = "YES", advance: bool = True) -> MarketSnapshot:
         snap = self._client.get_market_snapshot_clob(market_id, outcome=outcome) or {}
@@ -33,17 +47,61 @@ class PolymarketAPIProvider:
         best_ask = snap.get("best_ask")
         mid = snap.get("mid_price")
         last_trade_price = snap.get("last_trade_price")
-        spread_pct = compute_spread_pct(best_bid, best_ask, compute_mid(best_bid, best_ask, mid))
+        depth_bid_1 = snap.get("depth_bid_1")
+        depth_ask_1 = snap.get("depth_ask_1")
+
+        # Determine a reliable mid: prefer Gamma outcomePrices, then LTP.
+        gamma_mid = self._gamma_mid(market_id)
+        ref_mid = gamma_mid or last_trade_price
+
+        # Detect stale/extreme book and synthesize tighter bid/ask.
+        if ref_mid is not None and best_bid is not None and best_ask is not None:
+            raw_spread = (best_ask - best_bid) / ref_mid if ref_mid > 0 else 999.0
+            if raw_spread > self._SPREAD_SANITY_THRESHOLD:
+                best_bid = ref_mid
+                best_ask = ref_mid
+                mid = ref_mid
+                depth_bid_1 = None
+                depth_ask_1 = None
+        elif ref_mid is not None and (best_bid is None or best_ask is None):
+            best_bid = ref_mid
+            best_ask = ref_mid
+            mid = ref_mid
+
+        if mid is None:
+            mid = compute_mid(best_bid, best_ask, mid)
+
+        spread_pct = compute_spread_pct(best_bid, best_ask, mid)
         return MarketSnapshot(
             market_id=market_id,
             best_bid=best_bid,
             best_ask=best_ask,
             mid_price=mid,
             spread_pct=spread_pct,
-            depth_bid_1=snap.get("depth_bid_1"),
-            depth_ask_1=snap.get("depth_ask_1"),
+            depth_bid_1=depth_bid_1,
+            depth_ask_1=depth_ask_1,
             last_trade_price=last_trade_price,
         )
+
+    def _gamma_mid(self, market_id: str) -> Optional[float]:
+        """Extract YES outcome price from cached Gamma market data."""
+        m = self._market_cache.get(market_id)
+        if not m:
+            return None
+        op_raw = m.get("outcomePrices")
+        if isinstance(op_raw, str):
+            try:
+                op = json.loads(op_raw)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        else:
+            op = op_raw
+        if isinstance(op, list) and len(op) >= 1:
+            try:
+                return float(op[0])
+            except (TypeError, ValueError):
+                return None
+        return None
 
 
 class FixtureProvider:
