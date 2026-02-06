@@ -6,6 +6,18 @@ from datetime import datetime
 from threading import Lock
 from typing import Dict, Any, List, Optional
 
+from pnl import (
+    assert_shares_consistent,
+    compute_cost_basis,
+    compute_current_value,
+    compute_proceeds,
+    compute_realized_pnl,
+    compute_shares,
+    compute_unrealized_pnl,
+    reconcile_trade_ledger,
+    validate_trade_field_semantics,
+)
+
 logger = logging.getLogger(__name__)
 
 # Tab names
@@ -13,6 +25,7 @@ TAB_PORTFOLIO = "Portfolio Summary"
 TAB_TARGET_POSITIONS = "Target Positions"
 TAB_OUR_TRADES = "Our Trades"
 TAB_COMPARISON = "Comparison"
+TAB_EXECUTION_DIAGNOSTICS = "Execution Diagnostics"
 
 
 class GoogleSheetsSync:
@@ -70,9 +83,9 @@ class GoogleSheetsSync:
         existing_tabs = [ws.title for ws in sheet.worksheets()]
 
         # Create missing tabs
-        for tab_name in [TAB_PORTFOLIO, TAB_TARGET_POSITIONS, TAB_OUR_TRADES, TAB_COMPARISON]:
+        for tab_name in [TAB_PORTFOLIO, TAB_TARGET_POSITIONS, TAB_OUR_TRADES, TAB_COMPARISON, TAB_EXECUTION_DIAGNOSTICS]:
             if tab_name not in existing_tabs:
-                sheet.add_worksheet(title=tab_name, rows=100, cols=10)
+                sheet.add_worksheet(title=tab_name, rows=200, cols=20)
                 logger.info(f"Created sheet tab: {tab_name}")
 
     def _format_currency(self, value: float) -> str:
@@ -98,6 +111,28 @@ class GoogleSheetsSync:
     def _format_percentage(self, value: float) -> str:
         """Format value as percentage."""
         return f"{value:.2%}"
+
+    def _format_pnl_percentage(self, value: float, decimals: int = 1) -> str:
+        """Format P&L percentage without leading + that breaks Sheets.
+
+        Google Sheets USER_ENTERED mode interprets '+' as a formula operator,
+        causing #ERROR!. This method formats percentages safely.
+
+        Args:
+            value: The percentage value (already multiplied by 100)
+            decimals: Number of decimal places (default 1)
+
+        Returns:
+            Formatted percentage string like "5.0%" or "-3.2%"
+        """
+        if value is None:
+            return "-"
+        if decimals == 1:
+            return f"{value:.1f}%"
+        elif decimals == 2:
+            return f"{value:.2f}%"
+        else:
+            return f"{value:.{decimals}f}%"
 
     def _format_market_link(self, market_slug: str, market_id: str = "") -> str:
         """Format market name as hyperlink to Polymarket.
@@ -214,15 +249,11 @@ class GoogleSheetsSync:
             except (ValueError, TypeError):
                 pass
 
-        # Calculate allocated cash (invested in open positions)
-        allocated_in_deals = initial_budget - cash_available
-        if allocated_in_deals < 0:
-            allocated_in_deals = 0  # Handle edge case
+        # Reconciled open allocation is current portfolio value minus available cash.
+        allocated_in_deals = max(current_value - cash_available, 0.0)
 
-        # Use passed unrealized_pnl if provided, otherwise calculate as fallback
-        # pnl_total is ONLY realized P&L from closed trades
+        # Use passed unrealized_pnl if provided, otherwise calculate from equity drift.
         if unrealized_pnl is None:
-            # Fallback calculation (may be inaccurate)
             unrealized_pnl = (current_value - initial_budget) - pnl_total
 
         # Total P&L = unrealized + realized
@@ -314,7 +345,7 @@ class GoogleSheetsSync:
             # Calculate P&L % based on cost basis
             if cost_basis > 0:
                 pnl_pct = (pnl / cost_basis) * 100
-                pnl_pct_str = f"{pnl_pct:+.1f}%"
+                pnl_pct_str = self._format_pnl_percentage(pnl_pct)
             else:
                 pnl_pct_str = "-"
 
@@ -374,17 +405,33 @@ class GoogleSheetsSync:
                 if market_id and slug:
                     slug_lookup[market_id] = slug
 
-        # Header row - unified structure for true comparison
-        headers = ["Market", "Side", "Shares", "Cost Basis", "Current Value", "Entry Price", "Current Price", "P&L", "P&L %", "Status"]
+        # Header row - explicit realized/unrealized accounting columns.
+        headers = [
+            "Market",
+            "Side",
+            "Shares",
+            "Cost Basis",
+            "Current Value",
+            "Entry Price",
+            "Exit Price",
+            "Current Price",
+            "Proceeds",
+            "Realized P&L",
+            "Unrealized P&L",
+            "P&L",
+            "P&L %",
+            "Status",
+        ]
         data = [headers]
 
         # Add trade rows
         for trade in trades:
             status = trade.get("status") or "open"
-            pnl = trade.get("pnl")
-
-            size = trade.get("size") or 0  # USD invested (cost basis)
-            entry_price = trade.get("price") or 0
+            semantics_errors = validate_trade_field_semantics(trade)
+            if semantics_errors:
+                raise ValueError("; ".join(semantics_errors))
+            size = float(trade.get("size") or 0.0)  # legacy cost basis USD
+            entry_price = float(trade.get("price") or 0.0)
             market_id = trade.get("market") or ""
 
             # Use slug from trade, or look up from target positions
@@ -395,38 +442,60 @@ class GoogleSheetsSync:
             # Use outcome from trade record (YES/NO), fallback to YES for legacy trades
             side = trade.get("outcome") or "YES"
 
-            # Calculate shares from cost basis
-            shares = size / entry_price if entry_price > 0 else 0
+            shares = float(trade.get("shares") or 0.0)
+            if shares <= 0 and entry_price > 0:
+                shares = compute_shares(size, entry_price)
+            cost_basis_usd = compute_cost_basis(shares, entry_price)
+            if cost_basis_usd <= 0:
+                cost_basis_usd = size
+            assert_shares_consistent(
+                shares=shares,
+                entry_price=entry_price,
+                cost_basis_usd=cost_basis_usd,
+            )
 
-            # For closed trades, use sell_price as current price
-            # For open trades, use current_price (updated in real-time)
+            exit_price = trade.get("sell_price")
+            current_price = trade.get("current_price")
+            if current_price is None:
+                current_price = float(exit_price) if exit_price is not None else entry_price
+            current_price = float(current_price)
+
             if status == "closed":
-                current_price = trade.get("sell_price") or entry_price
+                effective_exit = float(exit_price) if exit_price is not None else None
+                proceeds = compute_proceeds(shares, effective_exit)
+                realized_pnl = compute_realized_pnl(
+                    shares=shares,
+                    entry_price=entry_price,
+                    exit_price=effective_exit,
+                )
+                unrealized_pnl = 0.0
+                current_value = proceeds
             else:
-                current_price = trade.get("current_price") or entry_price
+                current_value = compute_current_value(shares, current_price)
+                unrealized_pnl = compute_unrealized_pnl(
+                    shares=shares,
+                    entry_price=entry_price,
+                    current_price=current_price,
+                )
+                realized_pnl = 0.0
+                proceeds = 0.0
 
-            # Calculate current value
-            current_value = shares * current_price
-
-            # Format P&L
-            pnl_str = self._format_pnl(pnl) if pnl is not None else "-"
-
-            # Calculate P&L % based on cost basis
-            if size > 0 and pnl is not None:
-                pnl_pct = (pnl / size) * 100
-                pnl_pct_str = f"{pnl_pct:+.1f}%"
-            else:
-                pnl_pct_str = "-"
+            pnl_value = unrealized_pnl if status == "open" else realized_pnl
+            pnl_pct_str = self._format_pnl_percentage((pnl_value / cost_basis_usd) * 100) if cost_basis_usd > 0 else "-"
 
             row = [
                 self._format_market_link(market_slug, market_id),
                 side,
                 f"{shares:.4f}",
-                self._format_currency(size),  # Cost basis
+                self._format_currency(cost_basis_usd),
                 self._format_currency(current_value),
                 f"{entry_price:.4f}",
+                f"{float(exit_price):.4f}" if exit_price is not None else "-",
                 f"{current_price:.4f}",
-                pnl_str,
+                self._format_currency(proceeds) if status == "closed" else "-",
+                self._format_pnl(realized_pnl),
+                self._format_pnl(unrealized_pnl),
+                self._format_pnl(pnl_value),
                 pnl_pct_str,
                 status,
             ]
@@ -476,7 +545,7 @@ class GoogleSheetsSync:
         # ============================================================
         # Section 1: SHARED POSITIONS ANALYSIS (only markets both have)
         # ============================================================
-        data.append(["=== SHARED POSITIONS ANALYSIS ===", "", "", ""])
+        data.append(["--- SHARED POSITIONS ANALYSIS ---", "", "", ""])
         data.append(["(Only markets where we copied the whale)", "", "", ""])
         data.append(["", "", "", ""])
 
@@ -560,9 +629,9 @@ class GoogleSheetsSync:
             ])
             data.append([
                 "Total P&L (%)",
-                f"{target_pnl_pct:+.1f}%",
-                f"{our_pnl_pct:+.1f}%",
-                f"{our_pnl_pct - target_pnl_pct:+.1f}%",
+                self._format_pnl_percentage(target_pnl_pct),
+                self._format_pnl_percentage(our_pnl_pct),
+                self._format_pnl_percentage(our_pnl_pct - target_pnl_pct),
             ])
             data.append([
                 "Winning Positions",
@@ -573,7 +642,7 @@ class GoogleSheetsSync:
             data.append([
                 "Avg Entry Slippage",
                 "-",
-                f"{avg_slippage:+.2f}%",
+                self._format_pnl_percentage(avg_slippage, decimals=2),
                 "(vs whale entry price)",
             ])
         else:
@@ -584,7 +653,7 @@ class GoogleSheetsSync:
         # ============================================================
         # Section 2: PER-MARKET COMPARISON (shared markets only)
         # ============================================================
-        data.append(["=== PER-MARKET COMPARISON (Shared Only) ===", "", "", "", "", "", "", "", "", ""])
+        data.append(["--- PER-MARKET COMPARISON (Shared Only) ---", "", "", "", "", "", "", "", "", ""])
         data.append([
             "Market",
             "Side",
@@ -620,7 +689,7 @@ class GoogleSheetsSync:
             # Entry price difference
             if t_avg_price > 0:
                 entry_diff = ((o_entry_price - t_avg_price) / t_avg_price) * 100
-                entry_diff_str = f"{entry_diff:+.2f}%"
+                entry_diff_str = self._format_pnl_percentage(entry_diff, decimals=2)
             else:
                 entry_diff_str = "-"
 
@@ -637,8 +706,8 @@ class GoogleSheetsSync:
                 self._format_pnl(t_pnl),
                 self._format_pnl(o_pnl),
                 self._format_pnl(o_pnl - t_pnl),
-                f"{t_pnl_pct:+.1f}%",
-                f"{o_pnl_pct:+.1f}%",
+                self._format_pnl_percentage(t_pnl_pct),
+                self._format_pnl_percentage(o_pnl_pct),
             ])
 
         if not shared_markets:
@@ -649,7 +718,7 @@ class GoogleSheetsSync:
         # ============================================================
         # Section 3: POSITION GAPS (informational)
         # ============================================================
-        data.append(["=== POSITION GAPS ===", "", "", ""])
+        data.append(["--- POSITION GAPS ---", "", "", ""])
         data.append(["", "", "", ""])
 
         # Markets target has that we don't (missed opportunities)
@@ -689,7 +758,7 @@ class GoogleSheetsSync:
         # ============================================================
         # Section 4: STRATEGY VIABILITY SUMMARY
         # ============================================================
-        data.append(["=== STRATEGY VIABILITY SUMMARY ===", "", ""])
+        data.append(["--- STRATEGY VIABILITY SUMMARY ---", "", ""])
         data.append(["Metric", "Value", "Interpretation"])
 
         # Coverage
@@ -731,7 +800,7 @@ class GoogleSheetsSync:
                 slippage_interp = "Poor - significant entry disadvantage"
             data.append([
                 "Avg Entry Slippage",
-                f"{avg_slippage:+.2f}%",
+                self._format_pnl_percentage(avg_slippage, decimals=2),
                 slippage_interp,
             ])
 
@@ -776,7 +845,7 @@ class GoogleSheetsSync:
         # ============================================================
         # Section 5: P&L % OVER TIME CHART
         # ============================================================
-        data.append(["=== P&L % OVER TIME (5-hour intervals) ===", "", "", "", ""])
+        data.append(["--- P&L % OVER TIME (5-hour intervals) ---", "", "", "", ""])
         data.append(["", "", "", "", ""])
 
         if pnl_history and len(pnl_history) >= 2:
@@ -804,9 +873,9 @@ class GoogleSheetsSync:
 
                 data.append([
                     time_str,
-                    f"{our_pnl:+.2f}%",
-                    f"{whale_pnl:+.2f}%",
-                    f"{diff:+.2f}%",
+                    self._format_pnl_percentage(our_pnl, decimals=2),
+                    self._format_pnl_percentage(whale_pnl, decimals=2),
+                    self._format_pnl_percentage(diff, decimals=2),
                     "",
                 ])
 
@@ -840,14 +909,14 @@ class GoogleSheetsSync:
 
                     data.append([
                         "Our Trend",
-                        f"{our_trend} {our_change:+.2f}% over period",
+                        f"{our_trend} {self._format_pnl_percentage(our_change, decimals=2)} over period",
                         "",
                         "",
                         "",
                     ])
                     data.append([
                         "Whale Trend",
-                        f"{whale_trend} {whale_change:+.2f}% over period",
+                        f"{whale_trend} {self._format_pnl_percentage(whale_change, decimals=2)} over period",
                         "",
                         "",
                         "",
@@ -880,6 +949,59 @@ class GoogleSheetsSync:
         worksheet.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
         logger.debug("Synced comparison data to Google Sheets")
 
+    def sync_execution_diagnostics(self, diagnostics: List[Dict[str, Any]]) -> None:
+        """Sync execution latency/slippage diagnostics to Google Sheets."""
+        sheet = self._get_sheet()
+        worksheet = sheet.worksheet(TAB_EXECUTION_DIAGNOSTICS)
+        headers = [
+            "Run ID",
+            "Order ID",
+            "Market",
+            "Side",
+            "Order Type",
+            "Whale Signal TS",
+            "Order Sent TS",
+            "Fill TS",
+            "Latency (ms)",
+            "Best Bid",
+            "Best Ask",
+            "Mid Price",
+            "Fill Price",
+            "Spread %",
+            "Quote Slippage %",
+            "Baseline Slippage %",
+            "Half Spread %",
+            "Spread Crossed",
+            "Whale Ref Type",
+            "Whale Ref Price",
+        ]
+        data = [headers]
+        for row in diagnostics:
+            data.append([
+                row.get("run_id", ""),
+                row.get("order_id", ""),
+                row.get("market_id", row.get("market", "")),
+                row.get("side", row.get("action", "")),
+                row.get("order_type", ""),
+                row.get("whale_signal_ts", row.get("whale_timestamp", "")),
+                row.get("order_sent_ts", row.get("our_timestamp", "")),
+                row.get("fill_ts", ""),
+                row.get("latency_ms", ""),
+                row.get("best_bid", ""),
+                row.get("best_ask", ""),
+                row.get("mid_price", ""),
+                row.get("fill_price", row.get("actual_fill_price", "")),
+                row.get("spread_pct", ""),
+                row.get("quote_slippage_pct", row.get("slippage_pct", "")),
+                row.get("baseline_slippage_pct", ""),
+                row.get("half_spread_pct", ""),
+                row.get("spread_crossed", ""),
+                row.get("whale_ref_type", ""),
+                row.get("whale_entry_ref_price", ""),
+            ])
+        worksheet.clear()
+        worksheet.update(range_name="A1", values=data, value_input_option="USER_ENTERED")
+
     def sync_all(
         self,
         config: Dict[str, Any],
@@ -889,6 +1011,7 @@ class GoogleSheetsSync:
         trade_stats: Optional[Dict[str, Any]] = None,
         unrealized_pnl: Optional[float] = None,
         pnl_history: Optional[List[Dict[str, Any]]] = None,
+        execution_diagnostics: Optional[List[Dict[str, Any]]] = None,
     ) -> bool:
         """Sync all data to Google Sheets.
 
@@ -921,12 +1044,19 @@ class GoogleSheetsSync:
             # Build whale profile URL
             whale_profile_url = f"https://polymarket.com/profile/{target_wallet}"
 
-            # Extract portfolio values
-            current_value = portfolio_stats.get("total_value", initial_budget)
-            cash_available = portfolio_stats.get("cash", initial_budget)
+            # Reconcile summary values from the ledger rows for consistency.
+            cash_available = float(portfolio_stats.get("cash", initial_budget))
+            ledger = reconcile_trade_ledger(
+                cash=cash_available,
+                trades=our_trades,
+                starting_equity=initial_budget,
+            )
+            current_value = ledger.get("total_value", cash_available)
             pnl_24h = portfolio_stats.get("pnl_24h", 0)
-            pnl_total = portfolio_stats.get("pnl_total", 0)
+            pnl_total = ledger.get("total_realized", portfolio_stats.get("pnl_total", 0))
             session_started = portfolio_stats.get("session_started")
+            if unrealized_pnl is None:
+                unrealized_pnl = ledger.get("total_unrealized", 0.0)
 
             # Sync portfolio summary
             self.sync_portfolio(
@@ -970,6 +1100,8 @@ class GoogleSheetsSync:
 
             # Sync comparison analysis
             self.sync_comparison(target_pos_dicts, our_trades, trade_stats, pnl_history)
+            if execution_diagnostics:
+                self.sync_execution_diagnostics(execution_diagnostics)
 
             with self._lock:
                 self._last_sync = datetime.now()

@@ -10,14 +10,16 @@ starting_budget: 10000
 position_sizing:
   strategy: "proportional"  # Options: proportional, fixed, risk_parity
   max_position_pct: 0.15    # Max 15% of portfolio in single position
-  min_position_pct: 0.01    # Min 1% of portfolio
+  min_position_pct: 0.001   # Min 0.1% of portfolio ($10 with $10k budget)
   leverage_cap: 1.0         # No leverage (conservative)
 
 # Risk Management
 risk_management:
   max_daily_loss_pct: 0.10  # Stop if down 10% in a day
+  max_weekly_loss_pct: 0.30 # Stop if down 30% in a week
   max_total_loss_pct: 0.25  # Stop if down 25% total
   cooldown_after_loss: 300  # Wait 5 min after big loss (seconds)
+  reconciliation_epsilon: 0.000001
   skip_high_risk_markets: true
 
 # Market Filters
@@ -32,6 +34,21 @@ execution:
   check_interval: 180       # Check for new trades every 3 minutes
   dry_run: true            # Start in simulation mode
   auto_execute: false      # Require manual approval for trades
+  order_type: "limit"      # Explicit order type for execution diagnostics
+  enable_execution_guardrails: false
+  run_tag: "default"
+  measurement_mode: false
+  measurement_trades: 30
+  measurement_max_size_usd: 5
+  measurement_market_filter: "all"
+  measurement_order_timeout_s: 15
+
+# Execution quality guardrails
+execution_quality:
+  low_tier_min_liquidity: 5000
+  low_tier_stability_seconds: 300
+  rebalance_cooldown_seconds: 180
+  drift_threshold_high: 0.30
 
 # API Settings
 api:
@@ -46,3 +63,5 @@ reporting:
   log_level: "INFO"
   save_charts: true
   webhook_url: ""          # Discord webhook for alerts (optional)
+  execution_diagnostics_csv: "execution_diagnostics.csv"
+  slippage_csv: "slippage.csv"

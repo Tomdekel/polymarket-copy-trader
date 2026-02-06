@@ -1,0 +1,12 @@
+[
+  {
+    "conditionId": "sample-mkt-1",
+    "title": "Sample Market One",
+    "outcomes": ["YES", "NO"]
+  },
+  {
+    "conditionId": "sample-mkt-2",
+    "title": "Sample Market Two",
+    "outcomes": ["YES", "NO"]
+  }
+]

@@ -98,7 +98,7 @@ class GammaAPIClient:
         try:
             return do_request()
         except requests.HTTPError as e:
-            status_code = e.response.status_code if e.response else None
+            status_code = e.response.status_code if e.response is not None else None
             raise APIError(f"HTTP {status_code}: {e}", status_code=status_code)
         except requests.RequestException as e:
             raise APIError(f"Request failed after {self.max_retries} retries: {e}")
@@ -121,17 +121,31 @@ class GammaAPIClient:
     # Convenience methods for common endpoints
     def get_positions(self, wallet_address: str) -> Dict[str, Any]:
         """Fetch positions for a wallet."""
-        # Data API returns a list directly, wrap in dict for consistency
-        result = self.get("/positions", params={"user": wallet_address})
+        wallet = wallet_address.lower()
+        try:
+            result = self.get(f"/portfolio/users/{wallet}/positions")
+        except APIError as e:
+            if e.status_code != 404:
+                raise
+            # Backward-compatible fallback endpoint still used in some environments.
+            result = self.get("/positions", params={"user": wallet})
         if isinstance(result, list):
             return {"positions": result}
         return result
 
     def get_portfolio_balance(self, wallet_address: str) -> Dict[str, Any]:
         """Fetch portfolio balance for a wallet."""
-        # Calculate from positions
-        positions = self.get_positions(wallet_address)
-        total_value = sum(p.get("currentValue", 0) for p in positions.get("positions", []))
+        wallet = wallet_address.lower()
+        try:
+            result = self.get(f"/portfolio/users/{wallet}/balance")
+            if isinstance(result, dict):
+                return result
+        except APIError as e:
+            if e.status_code != 404:
+                raise
+        # Fallback: calculate balance from positions if balance endpoint unavailable.
+        positions = self.get_positions(wallet)
+        total_value = sum(float(p.get("currentValue", p.get("value", 0)) or 0) for p in positions.get("positions", []))
         return {"balance": total_value}
 
     def get_market(self, market_id: str) -> Dict[str, Any]:
@@ -185,3 +199,51 @@ class GammaAPIClient:
         except (requests.RequestException, requests.HTTPError, ValueError, KeyError, TypeError, IndexError) as e:
             logger.debug(f"Failed to fetch CLOB price for {condition_id}: {e}")
             return None
+
+    def get_market_snapshot_clob(self, condition_id: str, outcome: str = "YES") -> Optional[Dict[str, Any]]:
+        """Fetch quote/depth snapshot for one market side from CLOB API."""
+        try:
+            url = f"{CLOB_API_BASE}/markets/{condition_id}"
+            resp = self.session.get(url, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, requests.HTTPError, ValueError) as e:
+            logger.debug(f"Failed to fetch CLOB snapshot for {condition_id}: {e}")
+            return None
+
+        token_index = 0 if outcome.upper() == "YES" else 1
+        token = {}
+        tokens = data.get("tokens", [])
+        if isinstance(tokens, list) and len(tokens) > token_index and isinstance(tokens[token_index], dict):
+            token = tokens[token_index]
+
+        def _as_float(*values) -> Optional[float]:
+            for value in values:
+                if value is None:
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        # Handle common variants from CLOB payloads.
+        best_bid = _as_float(token.get("bestBid"), token.get("best_bid"), data.get("bestBid"), data.get("best_bid"))
+        best_ask = _as_float(token.get("bestAsk"), token.get("best_ask"), data.get("bestAsk"), data.get("best_ask"))
+        midpoint = _as_float(token.get("mid"), token.get("midPrice"), data.get("mid"), data.get("midPrice"))
+        last_trade_price = _as_float(token.get("price"), token.get("lastTradePrice"), data.get("lastTradePrice"))
+
+        depth_bid_1 = _as_float(token.get("bestBidSize"), token.get("best_bid_size"), token.get("bidSize"))
+        depth_ask_1 = _as_float(token.get("bestAskSize"), token.get("best_ask_size"), token.get("askSize"))
+
+        if midpoint is None and best_bid is not None and best_ask is not None:
+            midpoint = (best_bid + best_ask) / 2.0
+
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid_price": midpoint,
+            "depth_bid_1": depth_bid_1,
+            "depth_ask_1": depth_ask_1,
+            "last_trade_price": last_trade_price,
+        }

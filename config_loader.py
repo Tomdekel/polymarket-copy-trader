@@ -5,9 +5,6 @@ from typing import Any, Dict, Optional
 import yaml
 from dotenv import load_dotenv
 
-# Load .env file if present
-load_dotenv()
-
 # Environment variable prefix
 ENV_PREFIX = "COPY_TRADER_"
 
@@ -19,6 +16,13 @@ DEFAULTS: Dict[str, Any] = {
         "check_interval": 30,
         "dry_run": True,
         "auto_execute": False,
+        "enable_execution_guardrails": False,
+        "run_tag": "default",
+        "measurement_mode": False,
+        "measurement_trades": 30,
+        "measurement_max_size_usd": 5.0,
+        "measurement_market_filter": "all",
+        "measurement_order_timeout_s": 15,
     },
     "position_sizing": {
         "strategy": "proportional",
@@ -28,8 +32,10 @@ DEFAULTS: Dict[str, Any] = {
     },
     "risk_management": {
         "max_daily_loss_pct": 0.10,
+        "max_weekly_loss_pct": 0.30,
         "max_total_loss_pct": 0.25,
         "cooldown_after_loss": 300,
+        "reconciliation_epsilon": 1e-6,
         "skip_high_risk_markets": True,
     },
     "filters": {
@@ -49,6 +55,24 @@ DEFAULTS: Dict[str, Any] = {
         "log_level": "INFO",
         "save_charts": True,
         "webhook_url": "",
+        "execution_diagnostics_csv": "execution_diagnostics.csv",
+    },
+    "execution_quality": {
+        "low_tier_min_liquidity": 5000,
+        "low_tier_stability_seconds": 300,
+        "rebalance_cooldown_seconds": 180,
+        "drift_threshold_high": 0.30,
+    },
+    "market_making": {
+        "tick_size": 0.01,
+        "k_ticks": 2,
+        "quote_size_usd": 10.0,
+        "max_spread_pct": 0.05,
+        "skew_ticks": 1.0,
+        "max_hold_time_sec": 14400,
+        "max_exposure_usd": 5000.0,
+        "max_per_market_exposure_usd": 500.0,
+        "fee_bps": 2.0,
     },
     "database": {
         "path": "trades.db",
@@ -67,6 +91,13 @@ ENV_MAPPING = {
     "DRY_RUN": "execution.dry_run",
     "CHECK_INTERVAL": "execution.check_interval",
     "AUTO_EXECUTE": "execution.auto_execute",
+    "ORDER_TYPE": "execution.order_type",
+    "ENABLE_EXECUTION_GUARDRAILS": "execution.enable_execution_guardrails",
+    "RUN_TAG": "execution.run_tag",
+    "MEASUREMENT_MODE": "execution.measurement_mode",
+    "MEASUREMENT_TRADES": "execution.measurement_trades",
+    "MEASUREMENT_MAX_SIZE_USD": "execution.measurement_max_size_usd",
+    "MEASUREMENT_MARKET_FILTER": "execution.measurement_market_filter",
     "LOG_LEVEL": "reporting.log_level",
     "WEBHOOK_URL": "reporting.webhook_url",
     "DB_PATH": "database.path",
@@ -74,6 +105,8 @@ ENV_MAPPING = {
     "MIN_POSITION_PCT": "position_sizing.min_position_pct",
     "MAX_DAILY_LOSS_PCT": "risk_management.max_daily_loss_pct",
     "MAX_TOTAL_LOSS_PCT": "risk_management.max_total_loss_pct",
+    "MAX_WEEKLY_LOSS_PCT": "risk_management.max_weekly_loss_pct",
+    "RECONCILIATION_EPSILON": "risk_management.reconciliation_epsilon",
     "MIN_LIQUIDITY": "filters.min_liquidity",
     "API_MAX_RETRIES": "api.max_retries",
     "API_TIMEOUT": "api.timeout",
@@ -149,6 +182,10 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     config = _deep_merge({}, DEFAULTS)
 
     # Load config file if exists
+    explicit_config_path = config_path is not None
+    if not explicit_config_path:
+        # Load .env for runtime execution paths that rely on implicit config loading.
+        load_dotenv()
     if config_path is None:
         config_path = os.getenv(f"{ENV_PREFIX}CONFIG_PATH", "config.yaml")
 

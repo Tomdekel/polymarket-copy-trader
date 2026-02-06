@@ -32,9 +32,8 @@ class TestRiskManager:
         """Test trading halt when daily loss limit is hit."""
         rm = RiskManager(sample_config)
         rm.set_starting_budget(10000)
-        rm.daily_pnl = -1100  # More than 10% daily loss
 
-        result = rm.check_risk(current_pnl=-1100)
+        result = rm.check_risk(current_pnl=-500, daily_pnl=-1100)
 
         assert result["allow_trade"] is False
         assert "Daily loss limit" in result["reason"]
@@ -44,7 +43,7 @@ class TestRiskManager:
         rm = RiskManager(sample_config)
         rm.set_starting_budget(10000)
 
-        result = rm.check_risk(current_pnl=-2600)  # More than 25% total loss
+        result = rm.check_risk(current_pnl=-2600, daily_pnl=-100)  # More than 25% total loss
 
         assert result["allow_trade"] is False
         assert "Total loss limit" in result["reason"]
@@ -57,7 +56,7 @@ class TestRiskManager:
         # Record a recent loss
         rm.record_loss()
 
-        result = rm.check_risk(current_pnl=0)
+        result = rm.check_risk(current_pnl=0, daily_pnl=0)
 
         assert result["allow_trade"] is False
         assert "Cooldown" in result["reason"]
@@ -70,7 +69,7 @@ class TestRiskManager:
         # Set loss time to 6 minutes ago (more than 5 minute cooldown)
         rm.last_loss_time = datetime.now() - timedelta(seconds=360)
 
-        result = rm.check_risk(current_pnl=0)
+        result = rm.check_risk(current_pnl=0, daily_pnl=0)
 
         assert result["allow_trade"] is True
 
@@ -119,6 +118,38 @@ class TestRiskManagerMarketFilters:
         assert rm.can_trade_market(1000, "test-market") is True
 
 
+class TestRiskManagerLossRecording:
+    """Test loss recording functionality."""
+
+    def test_record_loss_updates_daily_pnl(self, sample_config):
+        """Test that record_loss updates daily_pnl correctly."""
+        rm = RiskManager(sample_config)
+        rm.daily_pnl = 0
+
+        rm.record_loss(50.0)
+
+        assert rm.daily_pnl == -50.0
+        assert rm.last_loss_time is not None
+
+    def test_record_loss_negative_raises_error(self, sample_config):
+        """Test that negative loss_amount raises ValueError."""
+        rm = RiskManager(sample_config)
+
+        with pytest.raises(ValueError) as exc_info:
+            rm.record_loss(-50.0)
+
+        assert "non-negative" in str(exc_info.value)
+
+    def test_record_loss_zero_sets_cooldown(self, sample_config):
+        """Test that record_loss with 0 still sets cooldown."""
+        rm = RiskManager(sample_config)
+        rm.last_loss_time = None
+
+        rm.record_loss(0.0)
+
+        assert rm.last_loss_time is not None
+
+
 class TestRiskManagerEdgeCases:
     """Test edge cases in risk management."""
 
@@ -136,9 +167,16 @@ class TestRiskManagerEdgeCases:
         rm = RiskManager(sample_config)
         rm.set_starting_budget(0)
 
-        # Should not crash on division by zero
+        # Zero budget should halt trading (not crash on division by zero)
         result = rm.check_risk(current_pnl=-100)
 
-        # With zero budget, any loss percentage would be infinite
-        # Implementation should handle this gracefully
-        assert result is not None
+        assert result["allow_trade"] is False
+        assert "Invalid starting budget" in result["reason"]
+
+    def test_risk_halt_on_realized_daily_loss(self, sample_config):
+        """Daily realized loss breach should halt trading."""
+        rm = RiskManager(sample_config)
+        rm.set_starting_budget(10000)
+        result = rm.check_risk(current_pnl=-300, daily_pnl=-1200, weekly_pnl=-1200)
+        assert result["allow_trade"] is False
+        assert "Daily loss limit" in result["reason"]

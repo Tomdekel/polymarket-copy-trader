@@ -1,4 +1,5 @@
 """SQLite database for trade history."""
+import logging
 import re
 import sqlite3
 import threading
@@ -6,9 +7,21 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
+from pnl import (
+    compute_shares,
+    compute_realized_pnl,
+    compute_unrealized_pnl,
+    compute_proceeds,
+    reconcile_trade_ledger,
+    validate_trade_field_semantics,
+    assert_price_probability,
+    assert_shares_consistent,
+)
+
 # Maximum allowed length for string fields
 MAX_MARKET_ID_LENGTH = 256
 MAX_WALLET_ADDRESS_LENGTH = 42
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -119,6 +132,52 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
+        # Add accounting columns if they don't exist
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN shares REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN current_value REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN proceeds REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN realized_pnl REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN unrealized_pnl REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN entry_price_source TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN current_price_source TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN exit_price_source TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN fill_price_source TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN run_id TEXT")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN run_tag TEXT")
+        except sqlite3.OperationalError:
+            pass
+
         # Create pnl_history table for time-series comparison
         conn.execute("""
             CREATE TABLE IF NOT EXISTS pnl_history (
@@ -136,6 +195,8 @@ class Database:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_market_status ON trades(market, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_pnl_history_timestamp ON pnl_history(timestamp)")
+        # Closed trades use sell_price as exit_price; keep current_price reserved for open trades.
+        conn.execute("UPDATE trades SET current_price = NULL WHERE status = 'closed'")
         conn.commit()
 
     def close(self) -> None:
@@ -193,7 +254,10 @@ class Database:
 
     def add_trade(self, market: str, side: str, size: float,
                   price: float, target_wallet: str, market_slug: str = "",
-                  outcome: str = "") -> int:
+                  outcome: str = "", entry_price_source: str = "unknown",
+                  current_price_source: str = "unknown",
+                  run_id: Optional[str] = None,
+                  run_tag: Optional[str] = None) -> int:
         """Add a trade and update cash balance accordingly.
 
         Args:
@@ -219,15 +283,39 @@ class Database:
             raise ValueError("Trade size must be positive")
         if price <= 0:
             raise ValueError("Trade price must be positive")
+        assert_price_probability(float(price), "entry_price")
         if len(target_wallet) > MAX_WALLET_ADDRESS_LENGTH:
             raise ValueError("Invalid target wallet address")
 
         with self._lock:
             conn = self._get_conn()
             cursor = conn.execute(
-                """INSERT INTO trades (timestamp, market, side, size, price, target_wallet, market_slug, outcome)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (datetime.now().isoformat(), market, side, size, price, target_wallet, market_slug, outcome)
+                """INSERT INTO trades
+                   (timestamp, market, side, size, price, target_wallet, market_slug, outcome,
+                    shares, current_price, current_value, proceeds, realized_pnl, unrealized_pnl, pnl, status,
+                    entry_price_source, current_price_source, exit_price_source, fill_price_source, run_id, run_tag)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, NULL, NULL, ?, ?)""",
+                (
+                    datetime.now().isoformat(),
+                    market,
+                    side,
+                    size,
+                    price,
+                    target_wallet,
+                    market_slug,
+                    outcome,
+                    compute_shares(size, price),
+                    price,
+                    size,  # initial current value equals cost basis at entry
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    entry_price_source,
+                    current_price_source,
+                    run_id,
+                    run_tag,
+                )
             )
             trade_id = cursor.lastrowid
 
@@ -243,11 +331,11 @@ class Database:
             conn.commit()
             return trade_id
 
-    def update_trade_pnl(self, trade_id: int, current_price: float) -> float:
+    def update_trade_pnl(self, trade_id: int, current_price: float, current_price_source: str = "mark") -> float:
         """Update PnL and current price for a specific trade.
 
         Note: 'size' in the database is USD invested, not number of shares.
-        We must convert to shares first: shares = size / entry_price
+        Uses the authoritative pnl module for calculations.
 
         Args:
             trade_id: The trade ID to update
@@ -259,13 +347,17 @@ class Database:
         conn = self._get_conn()
         conn.row_factory = sqlite3.Row
         cursor = conn.execute(
-            "SELECT side, size, price FROM trades WHERE id = ?", (trade_id,)
+            "SELECT side, size, price, shares, status, pnl FROM trades WHERE id = ?", (trade_id,)
         )
         row = cursor.fetchone()
         conn.row_factory = None
 
         if not row:
             return 0.0
+
+        if (row["status"] or "open").lower() != "open":
+            return float(row["pnl"] or 0.0)
+        assert_price_probability(float(current_price), "current_price")
 
         entry_price = row["price"]
         size = row["size"]  # USD invested, not shares
@@ -274,73 +366,173 @@ class Database:
         if entry_price <= 0:
             return 0.0
 
-        # Convert USD invested to number of shares
-        shares = size / entry_price
+        shares = float(row["shares"] or 0.0) or compute_shares(size, entry_price)
+        assert_shares_consistent(
+            shares=shares,
+            entry_price=float(entry_price),
+            cost_basis_usd=float(size),
+        )
 
-        # Calculate P&L based on shares
         # For BUY, profit if price goes up; for SELL (short), profit if price goes down
         if side.upper() == "BUY":
-            pnl = (current_price - entry_price) * shares
+            unrealized_pnl = compute_unrealized_pnl(shares, entry_price, current_price)
         else:
-            pnl = (entry_price - current_price) * shares
+            # For short positions, profit when price goes down
+            unrealized_pnl = shares * (entry_price - current_price)
 
-        # Store both P&L and current price for display
+        current_value = shares * current_price
+
         conn.execute(
-            "UPDATE trades SET pnl = ?, current_price = ? WHERE id = ?",
-            (pnl, current_price, trade_id)
+            """UPDATE trades
+               SET shares = ?, current_price = ?, current_value = ?,
+                   unrealized_pnl = ?, realized_pnl = COALESCE(realized_pnl, 0), pnl = ?, current_price_source = ?
+               WHERE id = ?""",
+            (shares, current_price, current_value, unrealized_pnl, unrealized_pnl, current_price_source, trade_id)
         )
         conn.commit()
-        return pnl
+        return unrealized_pnl
 
-    def close_trade(self, trade_id: int, exit_price: float) -> float:
+    def close_trade(
+        self,
+        trade_id: int,
+        exit_price: float,
+        close_size: Optional[float] = None,
+        exit_price_source: str = "unknown",
+        fill_price_source: str = "unknown",
+    ) -> float:
         """Close a trade and realize PnL.
 
         Note: 'size' in the database is USD invested, not number of shares.
-        We must convert to shares first: shares = size / entry_price
+        Uses the authoritative pnl module for calculations.
         """
-        conn = self._get_conn()
-        conn.row_factory = sqlite3.Row
-        cursor = conn.execute(
-            "SELECT side, size, price FROM trades WHERE id = ?", (trade_id,)
-        )
-        row = cursor.fetchone()
-        conn.row_factory = None
+        with self._lock:
+            conn = self._get_conn()
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                "SELECT * FROM trades WHERE id = ? AND status = 'open'",
+                (trade_id,),
+            )
+            row = cursor.fetchone()
+            conn.row_factory = None
 
-        if not row:
-            return 0.0
+            if not row:
+                return 0.0
+            assert_price_probability(float(exit_price), "exit_price")
 
-        entry_price = row["price"]
-        size = row["size"]  # USD invested, not shares
-        side = row["side"]
+            entry_price = float(row["price"] or 0.0)
+            size = float(row["size"] or 0.0)
+            side = row["side"]
+            shares_total = float(row["shares"] or 0.0) or compute_shares(size, entry_price)
+            assert_shares_consistent(
+                shares=shares_total,
+                entry_price=entry_price,
+                cost_basis_usd=size,
+            )
 
-        if entry_price <= 0:
-            return 0.0
+            if entry_price <= 0 or size <= 0:
+                return 0.0
 
-        # Convert USD invested to number of shares
-        shares = size / entry_price
+            close_size = size if close_size is None else min(max(close_size, 0.0), size)
+            if close_size <= 0:
+                return 0.0
 
-        # Calculate final PnL based on shares
-        if side.upper() == "BUY":
-            pnl = (exit_price - entry_price) * shares
-        else:
-            pnl = (entry_price - exit_price) * shares
+            shares_to_close = compute_shares(close_size, entry_price)
+            if side.upper() == "BUY":
+                realized_pnl = compute_realized_pnl(shares_to_close, entry_price, exit_price)
+            else:
+                # For short positions, profit when exit price is lower than entry
+                realized_pnl = shares_to_close * (entry_price - exit_price)
+            proceeds = compute_proceeds(shares_to_close, exit_price)
 
-        # Proceeds = shares * exit_price (what we get back from selling)
-        proceeds = shares * exit_price
+            closed_at = datetime.now().isoformat()
+            is_full_close = abs(close_size - size) < 1e-9
 
-        # Update trade status, PnL, sell price, and closed timestamp
-        conn.execute(
-            "UPDATE trades SET status = 'closed', pnl = ?, sell_price = ?, closed_at = ? WHERE id = ?",
-            (pnl, exit_price, datetime.now().isoformat(), trade_id)
-        )
+            if is_full_close:
+                conn.execute(
+                    """UPDATE trades
+                       SET status = 'closed', sell_price = ?, closed_at = ?,
+                           shares = ?, current_price = NULL, current_value = ?,
+                           proceeds = ?, realized_pnl = ?, unrealized_pnl = 0, pnl = ?,
+                           exit_price_source = ?, fill_price_source = ?
+                       WHERE id = ?""",
+                    (
+                        exit_price,
+                        closed_at,
+                        shares_total,
+                        proceeds,
+                        proceeds,
+                        realized_pnl,
+                        realized_pnl,
+                        exit_price_source,
+                        fill_price_source,
+                        trade_id,
+                    ),
+                )
+            else:
+                # Insert a closed row for the realized portion.
+                conn.execute(
+                    """INSERT INTO trades
+                       (timestamp, market, side, size, price, target_wallet, market_slug, outcome,
+                        shares, current_price, current_value, sell_price, closed_at,
+                        proceeds, realized_pnl, unrealized_pnl, pnl, status,
+                        entry_price_source, current_price_source, exit_price_source, fill_price_source, run_id, run_tag)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'closed', ?, NULL, ?, ?, ?, ?)""",
+                    (
+                        closed_at,
+                        row["market"],
+                        side,
+                        close_size,
+                        entry_price,
+                        row["target_wallet"],
+                        row["market_slug"],
+                        row["outcome"],
+                        shares_to_close,
+                        None,
+                        proceeds,
+                        exit_price,
+                        closed_at,
+                        proceeds,
+                        realized_pnl,
+                        0.0,
+                        realized_pnl,
+                        row["entry_price_source"] if "entry_price_source" in row.keys() and row["entry_price_source"] else "unknown",
+                        exit_price_source,
+                        fill_price_source,
+                        row["run_id"] if "run_id" in row.keys() else None,
+                        row["run_tag"] if "run_tag" in row.keys() else None,
+                    ),
+                )
 
-        # Add proceeds back to cash and update total PnL
-        conn.execute(
-            "UPDATE portfolio SET cash = cash + ?, pnl_total = pnl_total + ? WHERE id = 1",
-            (proceeds, pnl)
-        )
-        conn.commit()
-        return pnl
+                remaining_size = size - close_size
+                remaining_shares = max(shares_total - shares_to_close, 0.0)
+                remaining_unrealized = compute_unrealized_pnl(
+                    remaining_shares, entry_price, exit_price
+                )
+                remaining_current_value = remaining_shares * exit_price
+                conn.execute(
+                    """UPDATE trades
+                       SET size = ?, shares = ?, current_price = ?, current_value = ?,
+                           unrealized_pnl = ?, pnl = ?, proceeds = COALESCE(proceeds, 0),
+                           realized_pnl = COALESCE(realized_pnl, 0), current_price_source = ?
+                       WHERE id = ?""",
+                    (
+                        remaining_size,
+                        remaining_shares,
+                        exit_price,
+                        remaining_current_value,
+                        remaining_unrealized,
+                        remaining_unrealized,
+                        exit_price_source,
+                        trade_id,
+                    ),
+                )
+
+            conn.execute(
+                "UPDATE portfolio SET cash = cash + ?, pnl_total = pnl_total + ? WHERE id = 1",
+                (proceeds, realized_pnl),
+            )
+            conn.commit()
+            return realized_pnl
 
     def get_open_positions(self) -> List[Dict[str, Any]]:
         conn = self._get_conn()
@@ -365,22 +557,48 @@ class Database:
         return dict(row) if row else None
 
     def update_portfolio(self, total_value: float, cash: float,
-                         pnl_24h: float, pnl_total: float) -> None:
+                         pnl_24h: float) -> None:
+        """Update portfolio stats except pnl_total (which is updated by close_trade()).
+
+        Args:
+            total_value: Current total portfolio value
+            cash: Available cash balance
+            pnl_24h: P&L in the last 24 hours
+        """
         conn = self._get_conn()
+        # Note: pnl_total is NOT updated here - it's managed exclusively by close_trade()
+        # to avoid race conditions and double-counting
         conn.execute(
-            """UPDATE portfolio SET total_value = ?, cash = ?, pnl_24h = ?, pnl_total = ?, updated_at = ?
+            """UPDATE portfolio SET total_value = ?, cash = ?, pnl_24h = ?, updated_at = ?
                WHERE id = 1""",
-            (total_value, cash, pnl_24h, pnl_total, datetime.now().isoformat())
+            (total_value, cash, pnl_24h, datetime.now().isoformat())
         )
         conn.commit()
 
     def calculate_24h_pnl(self) -> float:
-        """Calculate PnL for trades in the last 24 hours."""
+        """Calculate realized PnL for closed trades in the last 24 hours."""
         conn = self._get_conn()
         cutoff = (datetime.now() - timedelta(hours=24)).isoformat()
         cursor = conn.execute(
-            "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE timestamp > ? AND pnl IS NOT NULL",
+            """SELECT COALESCE(SUM(COALESCE(realized_pnl, pnl)), 0)
+               FROM trades
+               WHERE status = 'closed'
+                 AND COALESCE(closed_at, timestamp) > ?""",
             (cutoff,)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else 0.0
+
+    def calculate_7d_pnl(self) -> float:
+        """Calculate realized PnL for closed trades in the last 7 days."""
+        conn = self._get_conn()
+        cutoff = (datetime.now() - timedelta(days=7)).isoformat()
+        cursor = conn.execute(
+            """SELECT COALESCE(SUM(COALESCE(realized_pnl, pnl)), 0)
+               FROM trades
+               WHERE status = 'closed'
+                 AND COALESCE(closed_at, timestamp) > ?""",
+            (cutoff,),
         )
         row = cursor.fetchone()
         return row[0] if row else 0.0
@@ -403,6 +621,152 @@ class Database:
         rows = [dict(row) for row in cursor.fetchall()]
         conn.row_factory = None
         return rows
+
+    def get_all_trades(self) -> List[Dict[str, Any]]:
+        """Get all trades ordered by timestamp ascending."""
+        conn = self._get_conn()
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute("SELECT * FROM trades ORDER BY timestamp ASC, id ASC")
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.row_factory = None
+        return rows
+
+    def get_all_trades_normalized(self) -> List[Dict[str, Any]]:
+        """Get all trades with explicit accounting field names."""
+        normalized: List[Dict[str, Any]] = []
+        for trade in self.get_all_trades():
+            entry_price = float(trade.get("price") or 0.0)
+            size_usd = float(trade.get("size") or 0.0)
+            shares = float(trade.get("shares") or 0.0) or compute_shares(size_usd, entry_price)
+            normalized.append({
+                "id": trade.get("id"),
+                "timestamp": trade.get("timestamp"),
+                "market": trade.get("market"),
+                "status": trade.get("status"),
+                "side": trade.get("side"),
+                "outcome": trade.get("outcome"),
+                "shares": shares,
+                "entry_price": entry_price,
+                "exit_price": trade.get("sell_price"),
+                "current_price": trade.get("current_price"),
+                "entry_price_source": trade.get("entry_price_source"),
+                "current_price_source": trade.get("current_price_source"),
+                "exit_price_source": trade.get("exit_price_source"),
+                "fill_price_source": trade.get("fill_price_source"),
+                "cost_basis_usd": size_usd,
+                "proceeds_usd": float(trade.get("proceeds") or 0.0),
+                "realized_pnl_usd": float(trade.get("realized_pnl") or 0.0),
+                "unrealized_pnl_usd": float(trade.get("unrealized_pnl") or 0.0),
+            })
+        return normalized
+
+    def reconcile_portfolio(self, starting_equity: Optional[float] = None) -> Dict[str, Any]:
+        """Reconcile portfolio totals from ledger rows."""
+        cash = self.get_cash_balance()
+        trades = self.get_all_trades()
+        return reconcile_trade_ledger(cash=cash, trades=trades, starting_equity=starting_equity)
+
+    def validate_trade_integrity(self, eps: float = 1e-6) -> List[str]:
+        """Validate core accounting identities on trade rows."""
+        issues: List[str] = []
+        open_value_total = 0.0
+        allowed_sources = {"fill", "quote", "mark", "whale_ref", "placeholder", "unknown"}
+        for trade in self.get_all_trades():
+            trade_id = trade.get("id")
+            status = (trade.get("status") or "open").lower()
+            issues.extend(validate_trade_field_semantics(trade, eps=eps))
+            for source_field in ("entry_price_source", "current_price_source", "exit_price_source", "fill_price_source"):
+                source_value = trade.get(source_field)
+                if source_value is not None and source_value not in allowed_sources:
+                    issues.append(f"trade_id={trade_id} invalid {source_field}={source_value}")
+            size = float(trade.get("size") or 0.0)
+            entry_price = float(trade.get("price") or 0.0)
+            shares = float(trade.get("shares") or 0.0)
+            if shares <= 0 and entry_price > 0:
+                shares = compute_shares(size, entry_price)
+
+            expected_cost_basis = shares * entry_price
+            if entry_price > 0 and abs(size - expected_cost_basis) > eps:
+                issues.append(
+                    f"trade_id={trade_id} cost_basis mismatch: size={size:.8f}, shares*entry={expected_cost_basis:.8f}"
+                )
+
+            if status == "open":
+                current_price = trade.get("current_price")
+                if current_price is not None:
+                    current_price = float(current_price)
+                    expected_current = shares * current_price
+                    stored_current = float(trade.get("current_value") or 0.0)
+                    open_value_total += expected_current
+                    if abs(stored_current - expected_current) > eps:
+                        issues.append(
+                            f"trade_id={trade_id} current_value mismatch: stored={stored_current:.8f}, expected={expected_current:.8f}"
+                        )
+                    expected_unrealized = compute_unrealized_pnl(shares, entry_price, current_price)
+                    stored_unrealized = float(trade.get("unrealized_pnl") or trade.get("pnl") or 0.0)
+                    if abs(stored_unrealized - expected_unrealized) > eps:
+                        issues.append(
+                            f"trade_id={trade_id} unrealized mismatch: stored={stored_unrealized:.8f}, expected={expected_unrealized:.8f}"
+                        )
+            else:
+                exit_price = trade.get("sell_price")
+                if exit_price is not None:
+                    exit_price = float(exit_price)
+                    expected_proceeds = shares * exit_price
+                    stored_proceeds = float(trade.get("proceeds") or 0.0)
+                    if abs(stored_proceeds - expected_proceeds) > eps:
+                        issues.append(
+                            f"trade_id={trade_id} proceeds mismatch: stored={stored_proceeds:.8f}, expected={expected_proceeds:.8f}"
+                        )
+                    expected_realized = compute_realized_pnl(shares, entry_price, exit_price)
+                    stored_realized = float(trade.get("realized_pnl") or trade.get("pnl") or 0.0)
+                    if abs(stored_realized - expected_realized) > eps:
+                        issues.append(
+                            f"trade_id={trade_id} realized mismatch: stored={stored_realized:.8f}, expected={expected_realized:.8f}"
+                        )
+        stats = self.get_portfolio_stats()
+        portfolio_current_value = float(stats.get("total_value") or 0.0)
+        cash = float(stats.get("cash") or 0.0)
+        expected_total = cash + open_value_total
+        if abs(portfolio_current_value - expected_total) > eps:
+            issues.append(
+                f"portfolio total mismatch: stored={portfolio_current_value:.8f}, expected={expected_total:.8f}"
+            )
+        return issues
+
+    def run_reconciliation_gate(self, mode: str, eps: float = 1e-6) -> None:
+        """Enforce last-mile accounting invariants before trading/reporting."""
+        issues = self.validate_trade_integrity(eps=eps)
+        mode_normalized = (mode or "").lower()
+
+        if mode_normalized == "live":
+            for trade in self.get_all_trades():
+                status = (trade.get("status") or "open").lower()
+                if status != "closed":
+                    continue
+                trade_id = trade.get("id")
+                if trade.get("sell_price") is None:
+                    issues.append(f"trade_id={trade_id} live invariant: closed trade missing exit_price")
+                if trade.get("exit_price_source") != "fill":
+                    issues.append(
+                        f"trade_id={trade_id} live invariant: exit_price_source must be 'fill', got {trade.get('exit_price_source')}"
+                    )
+                if trade.get("fill_price_source") != "fill":
+                    issues.append(
+                        f"trade_id={trade_id} live invariant: fill_price_source must be 'fill', got {trade.get('fill_price_source')}"
+                    )
+
+        if not issues:
+            return
+
+        for issue in issues:
+            logger.error("Reconciliation gate failed: %s", issue)
+
+        if mode_normalized == "live":
+            raise RuntimeError("Live reconciliation gate failed; halting trading")
+        if mode_normalized in {"backtest", "dry_run"}:
+            raise AssertionError("Backtest reconciliation gate failed")
+        raise RuntimeError("Reconciliation gate failed")
 
     def get_session_start_time(self) -> Optional[str]:
         """Get session start timestamp from portfolio or first trade.
@@ -451,13 +815,13 @@ class Database:
                 COUNT(CASE WHEN status = 'closed' THEN 1 END) as closed_trades,
                 COUNT(CASE WHEN side = 'BUY' THEN 1 END) as total_buys,
                 COUNT(CASE WHEN side = 'SELL' THEN 1 END) as total_sells,
-                COUNT(CASE WHEN status = 'closed' AND pnl > 0 THEN 1 END) as winning_trades,
-                COUNT(CASE WHEN status = 'closed' AND pnl < 0 THEN 1 END) as losing_trades,
+                COUNT(CASE WHEN status = 'closed' AND COALESCE(realized_pnl, pnl) > 0 THEN 1 END) as winning_trades,
+                COUNT(CASE WHEN status = 'closed' AND COALESCE(realized_pnl, pnl) < 0 THEN 1 END) as losing_trades,
                 AVG(size) as avg_trade_size,
-                AVG(CASE WHEN status = 'closed' AND pnl > 0 THEN pnl END) as avg_win,
-                AVG(CASE WHEN status = 'closed' AND pnl < 0 THEN pnl END) as avg_loss,
-                MAX(CASE WHEN status = 'closed' THEN pnl END) as largest_win,
-                MIN(CASE WHEN status = 'closed' THEN pnl END) as largest_loss
+                AVG(CASE WHEN status = 'closed' AND COALESCE(realized_pnl, pnl) > 0 THEN COALESCE(realized_pnl, pnl) END) as avg_win,
+                AVG(CASE WHEN status = 'closed' AND COALESCE(realized_pnl, pnl) < 0 THEN COALESCE(realized_pnl, pnl) END) as avg_loss,
+                MAX(CASE WHEN status = 'closed' THEN COALESCE(realized_pnl, pnl) END) as largest_win,
+                MIN(CASE WHEN status = 'closed' THEN COALESCE(realized_pnl, pnl) END) as largest_loss
             FROM trades
         """)
         row = cursor.fetchone()
@@ -540,6 +904,35 @@ class Database:
         rows = [dict(row) for row in cursor.fetchall()]
         conn.row_factory = None
         return rows
+
+    def reset_pnl_total(self) -> float:
+        """Reset corrupted pnl_total to 0.
+
+        Use this when pnl_total has been corrupted by a bug and needs
+        to be reset. Only realized P&L from closed trades should be
+        accumulated in pnl_total.
+
+        Returns:
+            The old pnl_total value before reset (for logging/verification)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        with self._lock:
+            conn = self._get_conn()
+            # Get the current value before reset
+            cursor = conn.execute("SELECT pnl_total FROM portfolio WHERE id = 1")
+            row = cursor.fetchone()
+            old_value = row[0] if row else 0.0
+
+            conn.execute("UPDATE portfolio SET pnl_total = 0 WHERE id = 1")
+            conn.commit()
+
+            logger.warning(
+                f"RESET pnl_total: old_value={old_value:.2f}, new_value=0.00, "
+                f"timestamp={datetime.now().isoformat()}"
+            )
+            return old_value
 
     def get_pnl_history_sampled(self, hours: int = 48, interval_hours: int = 5) -> List[Dict[str, Any]]:
         """Get P&L history sampled at regular intervals.

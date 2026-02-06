@@ -171,6 +171,64 @@ Deploy to Google Cloud Run with health checks, graceful shutdown, and environmen
 
 ---
 
+## Accounting Model (Shares vs Size)
+
+- `size` (or `cost_basis`) is **USD invested at entry**, not share quantity.
+- `shares` is computed as `size / entry_price` and is the quantity used in P&L math.
+- **Open/unrealized P&L**: `(current_price - entry_price) * shares`
+- **Closed/realized P&L**: `proceeds - cost_basis`, where `proceeds = shares * exit_price`
+- **Portfolio current value** always reconciles as: `cash + sum(open_position_current_value)`
+- Exported reports include explicit `realized_pnl`, `unrealized_pnl`, and unified `pnl` (status-aware).
+
+Use `python3 scripts/recompute_trade_metrics.py --db trades.db` to backfill accounting columns on historical rows.
+
+### Accounting invariants (must always hold)
+
+- Open trade:
+  - `abs(cost_basis_usd - shares * entry_price) < eps`
+  - `abs(current_value_usd - shares * current_price) < eps`
+- Closed trade:
+  - `abs(proceeds_usd - shares * exit_price) < eps`
+  - `abs(realized_pnl_usd - (proceeds_usd - cost_basis_usd)) < eps`
+- Portfolio:
+  - `abs(portfolio_current_value - (cash + sum(open_position_values))) < eps`
+- Field semantics:
+  - Open rows have `current_price` and **no** `exit_price`
+  - Closed rows have `exit_price` and **no** `current_price`
+  - `entry_price`, `current_price`, `exit_price` are probabilities in `[0, 1]`
+
+The bot runs a last-mile reconciliation gate each cycle and fails fast on violations (halts in live mode).
+
+---
+
+## Slippage Diagnostics Pipeline
+
+Execution diagnostics are stored in SQLite table `execution_records` and exported to `slippage.csv` for analysis.
+
+```bash
+# Smoke test the pipeline end-to-end (insert + export check)
+python3 scripts/smoke_execution_diagnostics.py --db trades.db --output slippage_smoke.csv
+
+# Export one row per filled order
+python3 scripts/export_slippage.py --db trades.db --output slippage.csv
+
+# Troubleshoot empty exports
+python3 scripts/export_slippage.py --db trades.db --output slippage.csv --debug
+
+# Analyze distributions, p50/p90/p95, and market rankings
+python3 scripts/analyze_slippage.py --input slippage.csv
+
+# Run controlled measurement run + export + analysis
+python3 scripts/run_slippage_experiment.py --db trades.db --n 30 --max-size-usd 5 --run-tag MIXED_MARKET
+
+# Run the three required cohorts and summarize
+python3 scripts/run_slippage_cohorts.py --db trades.db --n 30 --max-size-usd 5
+```
+
+See `docs/slippage_diagnostics.md` for metric definitions and baseline interpretation.
+
+---
+
 ## Configuration
 
 ### Config File (`config.yaml`)

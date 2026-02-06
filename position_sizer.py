@@ -10,6 +10,7 @@ class SizedPosition:
     our_size: float
     target_percentage: float
     our_percentage: float
+    drift_pct: float
 
 class PositionSizer:
     def __init__(self, budget: float, config: Dict[str, Any]):
@@ -42,13 +43,14 @@ class PositionSizer:
             our_current_size = our_current.get("size", 0)
             
             # Determine action
+            drift_pct = abs(our_target_size - our_current_size) / max(our_current_size, 1)
             if our_current_size == 0 and our_target_size > 0:
                 action = "BUY"
                 size = our_target_size
             elif our_current_size > 0 and our_target_size == 0:
                 action = "SELL"
                 size = our_current_size
-            elif abs(our_target_size - our_current_size) / max(our_current_size, 1) > 0.1:
+            elif drift_pct > 0.1:
                 # Rebalance if >10% difference
                 action = "BUY" if our_target_size > our_current_size else "SELL"
                 size = abs(our_target_size - our_current_size)
@@ -64,7 +66,8 @@ class PositionSizer:
                 target_size=target_pos.get("size", 0),
                 our_size=size,
                 target_percentage=target_pct,
-                our_percentage=our_pct
+                our_percentage=our_pct,
+                drift_pct=drift_pct,
             ))
         
         return sized

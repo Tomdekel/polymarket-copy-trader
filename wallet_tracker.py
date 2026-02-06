@@ -15,6 +15,8 @@ class Position:
     current_price: Optional[float]
     value: float
     pnl: float
+    liquidity: Optional[float] = None
+    timestamp: Optional[str] = None
 
 class WalletTracker:
     def __init__(self, wallet_address: str, api_client: Optional[GammaAPIClient] = None):
@@ -55,7 +57,9 @@ class WalletTracker:
                     avg_price=float(pos.get("avgPrice", pos.get("avg_price", 0))),
                     current_price=float(current_price) if current_price else None,
                     value=float(pos.get("currentValue", pos.get("value", 0))),
-                    pnl=float(pos.get("cashPnl", pos.get("pnl", 0)))
+                    pnl=float(pos.get("cashPnl", pos.get("pnl", 0))),
+                    liquidity=float(pos.get("liquidity", 0)) if pos.get("liquidity") is not None else None,
+                    timestamp=pos.get("timestamp") or pos.get("updatedAt"),
                 ))
             return positions
         except APIError as e:
@@ -112,6 +116,32 @@ class WalletTracker:
             return None
         except (IndexError, ValueError, TypeError):
             return None
+
+    def get_market_snapshot(self, market_id: str, outcome: str = "YES") -> Dict[str, Optional[float]]:
+        """Get best bid/ask snapshot for execution diagnostics."""
+        snapshot = self._client.get_market_snapshot_clob(market_id, outcome=outcome)
+        if snapshot:
+            return snapshot
+
+        price = self.get_market_price(market_id, outcome)
+        if price is None:
+            return {
+                "best_bid": None,
+                "best_ask": None,
+                "mid_price": None,
+                "depth_bid_1": None,
+                "depth_ask_1": None,
+                "last_trade_price": None,
+            }
+        # Conservative fallback: if we only have one price, treat it as both sides.
+        return {
+            "best_bid": price,
+            "best_ask": price,
+            "mid_price": price,
+            "depth_bid_1": None,
+            "depth_ask_1": None,
+            "last_trade_price": price,
+        }
 
     def get_position_current_price(self, position: Position) -> Optional[float]:
         """Get current price for an existing position."""
