@@ -12,7 +12,7 @@ from tenacity import (
 
 logger = logging.getLogger("polymarket_copy_trader")
 
-GAMMA_API_BASE = "https://data-api.polymarket.com"
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
 CLOB_API_BASE = "https://clob.polymarket.com"
 
 # Default rate limit settings

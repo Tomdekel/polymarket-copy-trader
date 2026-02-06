@@ -22,7 +22,10 @@ class PolymarketAPIProvider:
         self._client = client or GammaAPIClient()
 
     def get_markets(self) -> List[Dict[str, Any]]:
-        return self._client.get_markets(active=True, closed=False).get("markets", [])
+        result = self._client.get_markets(active=True, closed=False)
+        if isinstance(result, list):
+            return result
+        return result.get("markets", [])
 
     def get_snapshot(self, market_id: str, outcome: str = "YES", advance: bool = True) -> MarketSnapshot:
         snap = self._client.get_market_snapshot_clob(market_id, outcome=outcome) or {}
