@@ -47,6 +47,7 @@ def main() -> None:
     parser.add_argument("--max-per-market-exposure-usd", type=float, required=True, help="Max per-market exposure USD")
     parser.add_argument("--baseline", action="store_true", help="Enable baseline P&L checks")
     parser.add_argument("--baseline-fee-tolerance-usd", type=float, default=5.0, help="Tolerance for net ~= -fees")
+    parser.add_argument("--warn-zero-fills-after-min", type=float, default=10.0, help="Warn if 0 fills after N minutes")
     args = parser.parse_args()
 
     report_path = pathlib.Path(args.report_json)
@@ -78,7 +79,9 @@ def main() -> None:
 
     rows = _load_csv(pathlib.Path(args.fills_csv)) if args.fills_csv else []
     if not rows:
-        # No fills to check inventory violations on — pass.
+        runtime_min = float(report.get("execution", {}).get("runtime_sec", 0) or 0) / 60.0
+        if runtime_min > args.warn_zero_fills_after_min:
+            print(f"WARNING: 0 fills after {runtime_min:.1f} min runtime — consider using --fill-model probabilistic")
         print("PASS: acceptance checks succeeded (0 fills)")
         return
 

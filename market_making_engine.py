@@ -8,6 +8,7 @@ from typing import Dict, Optional, Tuple
 from data_provider import DataProvider
 from database import Database
 from execution_diagnostics import ExecutionDiagnostics
+from fill_model import DeterministicCrossingFillModel, FillModel
 from market_making_strategy import (
     MarketSnapshot,
     InventoryState,
@@ -58,6 +59,7 @@ class MarketMakingEngine:
         max_hold_time_sec: Optional[int],
         skew_ticks: float,
         fee_bps: float,
+        fill_model: Optional[FillModel] = None,
     ):
         self.db = db
         self.diagnostics = diagnostics
@@ -74,6 +76,7 @@ class MarketMakingEngine:
         self.max_hold_time_sec = max_hold_time_sec
         self.skew_ticks = skew_ticks
         self.fee_bps = fee_bps
+        self.fill_model: FillModel = fill_model or DeterministicCrossingFillModel()
         self._orders: Dict[Tuple[str, str], ActiveOrder] = {}
         self._order_seq = 0
         self._tier_selector = MeasurementSelector()
@@ -288,14 +291,16 @@ class MarketMakingEngine:
 
     def poll_fills(self, market_id: str, snapshot: MarketSnapshot) -> int:
         fills = 0
+        now = datetime.now(UTC)
         for side in ("buy", "sell"):
             key = (market_id, side)
             order = self._orders.get(key)
             if not order:
                 continue
-            if not _order_should_fill(order, snapshot.last_trade_price):
+            decision = self.fill_model.should_fill(order.side, order.price, snapshot, now)
+            if not decision.fill or decision.fill_price is None:
                 continue
-            fill = FillEvent(order=order, fill_price=float(snapshot.last_trade_price), fill_ts=datetime.now(UTC))
+            fill = FillEvent(order=order, fill_price=decision.fill_price, fill_ts=now)
             self._handle_fill(fill)
             del self._orders[key]
             fills += 1
@@ -377,14 +382,6 @@ class MarketMakingEngine:
             fill_price_source="fill",
         )
         return trade_id
-
-
-def _order_should_fill(order: ActiveOrder, last_trade_price: Optional[float]) -> bool:
-    if last_trade_price is None:
-        return False
-    if order.side == "buy":
-        return last_trade_price <= order.price + 1e-9
-    return last_trade_price >= order.price - 1e-9
 
 
 def _find_oldest_open(db: Database, market_id: str, side: str = "BUY") -> Optional[Dict[str, object]]:

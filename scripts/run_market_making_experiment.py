@@ -18,6 +18,7 @@ from config_loader import load_config
 from database import Database
 from data_provider import FixtureProvider, PolymarketAPIProvider
 from execution_diagnostics import ExecutionDiagnostics
+from fill_model import DeterministicCrossingFillModel, ProbabilisticFillModel
 from market_making_engine import MarketMakingEngine
 from market_making_rewards import RewardLedger
 from market_making_strategy import MarketSnapshot
@@ -104,6 +105,11 @@ def main() -> None:
     parser.add_argument("--data-mode", choices=["online", "offline"], default="online", help="Data provider mode")
     parser.add_argument("--fixture-dir", default=None, help="Fixture directory for offline mode")
     parser.add_argument("--fixture-profile", default="default", help="Fixture profile name (offline)")
+    parser.add_argument("--fill-model", choices=["strict", "probabilistic"], default="strict", help="Fill simulation model")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for probabilistic fill model")
+    parser.add_argument("--fill-alpha", type=float, default=1.5, help="Probabilistic model: exponential decay rate")
+    parser.add_argument("--fill-pmax", type=float, default=0.20, help="Probabilistic model: max per-step fill probability")
+    parser.add_argument("--fill-base-liquidity", type=float, default=0.10, help="Probabilistic model: base liquidity parameter")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -137,6 +143,17 @@ def main() -> None:
         provider = PolymarketAPIProvider()
     rewards = RewardLedger(db_path=args.db)
 
+    if args.fill_model == "probabilistic":
+        fill_model = ProbabilisticFillModel(
+            tick_size=tick_size,
+            alpha=args.fill_alpha,
+            base_liquidity=args.fill_base_liquidity,
+            p_max=args.fill_pmax,
+            seed=args.seed,
+        )
+    else:
+        fill_model = DeterministicCrossingFillModel()
+
     markets = _select_markets(provider, whitelist=whitelist, max_markets=args.markets)
     if not markets:
         raise SystemExit("No markets selected (whitelist empty and no Tier-A markets found)")
@@ -152,6 +169,7 @@ def main() -> None:
         "max_total_exposure": max_total_exposure,
         "max_per_market_exposure": max_per_market,
         "max_hold_time_sec": max_hold_time_sec,
+        "fill_model": args.fill_model,
         "markets": markets,
     }
     rewards.add_reward(
@@ -189,6 +207,7 @@ def main() -> None:
         max_hold_time_sec=max_hold_time_sec,
         skew_ticks=skew_ticks,
         fee_bps=fee_bps,
+        fill_model=fill_model,
     )
 
     start = time.time()
