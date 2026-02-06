@@ -34,14 +34,24 @@ def _load_whitelist(path: pathlib.Path) -> List[str]:
     return [str(x) for x in data if x]
 
 
+def _parse_json_field(value: Any) -> Any:
+    """Parse a field that may be a JSON-encoded string."""
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            return value
+    return value
+
+
 def _is_binary_market(market: Dict[str, Any]) -> bool:
-    outcomes = market.get("outcomes")
+    outcomes = _parse_json_field(market.get("outcomes"))
     if isinstance(outcomes, list) and len(outcomes) == 2:
         return True
-    tokens = market.get("tokens")
+    tokens = _parse_json_field(market.get("tokens"))
     if isinstance(tokens, list) and len(tokens) == 2:
         return True
-    outcome_prices = market.get("outcomePrices")
+    outcome_prices = _parse_json_field(market.get("outcomePrices"))
     if isinstance(outcome_prices, list) and len(outcome_prices) == 2:
         return True
     return False

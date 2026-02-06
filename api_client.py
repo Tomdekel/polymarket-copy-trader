@@ -236,6 +236,19 @@ class GammaAPIClient:
         depth_bid_1 = _as_float(token.get("bestBidSize"), token.get("best_bid_size"), token.get("bidSize"))
         depth_ask_1 = _as_float(token.get("bestAskSize"), token.get("best_ask_size"), token.get("askSize"))
 
+        # Fall back to the order book endpoint when bid/ask are missing.
+        if best_bid is None or best_ask is None:
+            token_id = token.get("token_id")
+            if token_id:
+                book = self._fetch_order_book(token_id)
+                if book:
+                    if best_bid is None and book.get("best_bid") is not None:
+                        best_bid = book["best_bid"]
+                        depth_bid_1 = depth_bid_1 or book.get("depth_bid_1")
+                    if best_ask is None and book.get("best_ask") is not None:
+                        best_ask = book["best_ask"]
+                        depth_ask_1 = depth_ask_1 or book.get("depth_ask_1")
+
         if midpoint is None and best_bid is not None and best_ask is not None:
             midpoint = (best_bid + best_ask) / 2.0
 
@@ -247,3 +260,25 @@ class GammaAPIClient:
             "depth_ask_1": depth_ask_1,
             "last_trade_price": last_trade_price,
         }
+
+    def _fetch_order_book(self, token_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch top-of-book from CLOB /book endpoint."""
+        try:
+            url = f"{CLOB_API_BASE}/book"
+            resp = self.session.get(url, params={"token_id": token_id}, timeout=self.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+        except (requests.RequestException, requests.HTTPError, ValueError) as e:
+            logger.debug(f"Failed to fetch order book for token {token_id}: {e}")
+            return None
+
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        result: Dict[str, Any] = {}
+        if bids:
+            result["best_bid"] = float(bids[0]["price"])
+            result["depth_bid_1"] = float(bids[0].get("size", 0))
+        if asks:
+            result["best_ask"] = float(asks[0]["price"])
+            result["depth_ask_1"] = float(asks[0].get("size", 0))
+        return result if result else None
